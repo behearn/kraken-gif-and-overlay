@@ -10,6 +10,7 @@ Ctrl+C switches the panel back to the liquid-temperature screen. If another prog
 
 ```
 --gif <path>           GIF to display
+--position <0-100>     Square crop on a wide or tall GIF. 0 is left or top, 50 centers, 100 is right or bottom. Default: 50
 --cpu-sensor <id>      CPU temperature sensor. Default: auto
 --gpu-sensor <id>      GPU temperature sensor. Default: auto
 --list-sensors         Print temperature sensors and exit
@@ -50,7 +51,9 @@ CPU and GPU temperatures are detected automatically. The CPU sensor is `Tctl`, `
 /usr/local/bin/kraken-gif-and-overlay --cpu-sensor <id> --gpu-sensor <id> --save-config
 ```
 
-Pass overlay switches with `--save-config` to store them too. `box` is `yes` or `no`. `opacity` is 0–255 and applies to the dark boxes behind the text. `color` is `RRGGBB` or `r,g,b`. The default colour is off-white `f2f2f2`. `font` is a `.ttf` file. When it is unset, DejaVu Sans Bold is used, then Noto Sans Bold.
+A GIF that is not square is cropped to its shorter side, then scaled, so a circle stays a circle. `--position` slides that square along the longer side: `0` keeps the left or top, `100` keeps the right or bottom, and `50` (the default) centers it.
+
+Pass `--position` or the overlay switches with `--save-config` to store them too. `box` is `yes` or `no`. `opacity` is 0–255 and applies to the dark boxes behind the text. `color` is `RRGGBB` or `r,g,b`. The default colour is off-white `f2f2f2`. `font` is a `.ttf` file. When it is unset, DejaVu Sans Bold is used, then Noto Sans Bold.
 
 ```bash
 /usr/local/bin/kraken-gif-and-overlay --box yes --opacity 150 --color f2f2f2 --font /usr/share/fonts/TTF/DejaVuSans-Bold.ttf --save-config

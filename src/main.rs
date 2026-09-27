@@ -49,7 +49,7 @@ fn main() -> Result<()> {
 
     let settings = load_settings(&args)?;
     println!("Loading {}", settings.gif.display());
-    let frames = load_gif(&settings.gif)?;
+    let frames = load_gif(&settings.gif, settings.position)?;
     let font = load_font(&settings.font)?;
     println!(
         "Kraken 2023 Elite: {WIDTH}x{HEIGHT}, {} GIF frames, Q565 stream",
@@ -235,6 +235,7 @@ struct Args {
     list_sensors: bool,
     save_config: bool,
     gif: Option<PathBuf>,
+    position: Option<u8>,
     cpu_sensor: Option<String>,
     gpu_sensor: Option<String>,
     boxes: Option<bool>,
@@ -251,6 +252,7 @@ fn parse_args() -> Result<Args> {
         list_sensors: false,
         save_config: false,
         gif: None,
+        position: None,
         cpu_sensor: None,
         gpu_sensor: None,
         boxes: None,
@@ -267,6 +269,12 @@ fn parse_args() -> Result<Args> {
             "--list-sensors" => args.list_sensors = true,
             "--save-config" => args.save_config = true,
             "--gif" => args.gif = Some(PathBuf::from(next_arg(&mut rest, "--gif needs a path")?)),
+            "--position" => {
+                args.position = Some(parse_position(&next_arg(
+                    &mut rest,
+                    "--position needs a percentage from 0 to 100",
+                )?)?)
+            }
             "--cpu-sensor" => args.cpu_sensor = Some(next_arg(&mut rest, "--cpu-sensor needs a sensor id")?),
             "--gpu-sensor" => args.gpu_sensor = Some(next_arg(&mut rest, "--gpu-sensor needs a sensor id")?),
             "--box" => args.boxes = Some(parse_bool(&next_arg(&mut rest, "--box needs yes or no")?)?),
@@ -304,6 +312,7 @@ fn print_usage() {
 Usage: {program} [options]
 
   --gif <path>           GIF to display
+  --position <0-100>     Square crop on a wide or tall GIF. 0 is left or top, 50 centers, 100 is right or bottom. Default: 50
   --save-config          Copy --gif into the data directory and write config
   --cpu-sensor <id>      CPU temperature sensor. Default: auto
   --gpu-sensor <id>      GPU temperature sensor. Default: auto
@@ -322,7 +331,7 @@ fn config_exists() -> Result<bool> {
     Ok(data_dir()?.join("config").is_file())
 }
 
-fn load_gif(path: &Path) -> Result<Vec<(RgbImage, Duration)>> {
+fn load_gif(path: &Path, position: u8) -> Result<Vec<(RgbImage, Duration)>> {
     let file = File::open(path).with_context(|| format!("GIF not found: {}", path.display()))?;
     let decoder = image::codecs::gif::GifDecoder::new(BufReader::new(file)).context("GIF decoder")?;
     let frames = decoder.into_frames().collect_frames().context("GIF frames")?;
@@ -334,10 +343,33 @@ fn load_gif(path: &Path) -> Result<Vec<(RgbImage, Duration)>> {
         let (numer, denom) = frame.delay().numer_denom_ms();
         let millis = if denom == 0 { 100 } else { numer / denom.max(1) };
         let rgb = image::DynamicImage::ImageRgba8(frame.into_buffer()).to_rgb8();
-        let scaled = image::imageops::resize(&rgb, WIDTH, HEIGHT, FilterType::Lanczos3);
+        let (width, height) = rgb.dimensions();
+        if width == 0 || height == 0 {
+            bail!("GIF frame has no pixels");
+        }
+        let square = crop_square(&rgb, position);
+        let scaled = image::imageops::resize(&square, WIDTH, HEIGHT, FilterType::Lanczos3);
         loaded.push((scaled, Duration::from_millis(millis.max(1) as u64)));
     }
     Ok(loaded)
+}
+
+/// Square window on the shorter side. `position` slides it along the longer side.
+fn square_origin(width: u32, height: u32, position: u8) -> (u32, u32, u32) {
+    let side = width.min(height);
+    let span = width.max(height) - side;
+    let offset = (u64::from(span) * u64::from(position) / 100) as u32;
+    if width >= height {
+        (offset, 0, side)
+    } else {
+        (0, offset, side)
+    }
+}
+
+fn crop_square(image: &RgbImage, position: u8) -> RgbImage {
+    let (width, height) = image.dimensions();
+    let (x, y, side) = square_origin(width, height, position);
+    image::imageops::crop_imm(image, x, y, side, side).to_image()
 }
 
 fn load_font(path: &Path) -> Result<FontArc> {
@@ -502,6 +534,7 @@ struct Overlay {
 
 struct Settings {
     gif: PathBuf,
+    position: u8,
     font: PathBuf,
     cpu: PathBuf,
     gpu: PathBuf,
@@ -573,6 +606,9 @@ fn load_settings(args: &Args) -> Result<Settings> {
         }
         updates.push(("cpu", cpu_id));
         updates.push(("gpu", gpu_id));
+        if let Some(position) = args.position {
+            updates.push(("position", position.to_string()));
+        }
         if let Some(boxes) = args.boxes {
             updates.push(("box", if boxes { "yes".to_string() } else { "no".to_string() }));
         }
@@ -606,9 +642,11 @@ fn load_settings(args: &Args) -> Result<Settings> {
     } else {
         font_path(&dir, configured.get("font").map(String::as_str))?
     };
+    let position = chosen(args.position, configured.get("position"), parse_position, 50)?;
     let overlay = overlay_from(&configured, args)?;
     Ok(Settings {
         gif,
+        position,
         font,
         cpu,
         gpu,
@@ -652,6 +690,17 @@ fn chosen<T>(
         Some(value) => parse(value),
         None => Ok(default),
     }
+}
+
+fn parse_position(value: &str) -> Result<u8> {
+    let text = value.trim().trim_end_matches('%').trim();
+    let number: u8 = text
+        .parse()
+        .context("position must be a percentage from 0 to 100")?;
+    if number > 100 {
+        bail!("position must be a percentage from 0 to 100");
+    }
+    Ok(number)
 }
 
 fn parse_bool(value: &str) -> Result<bool> {
@@ -1044,5 +1093,45 @@ fn format_temp(value: Option<f32>, suffix: &str) -> String {
     match value {
         Some(value) => format!("{}{suffix}", value.round() as i32),
         None => "--".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod crop {
+    use super::*;
+
+    #[test]
+    fn position_slides_the_square_along_the_long_side() {
+        let mut wide = RgbImage::from_pixel(6, 2, Rgb([0, 0, 0]));
+        wide.put_pixel(0, 0, Rgb([1, 0, 0]));
+        wide.put_pixel(2, 0, Rgb([0, 1, 0]));
+        wide.put_pixel(4, 0, Rgb([0, 0, 1]));
+        assert_eq!(*crop_square(&wide, 0).get_pixel(0, 0), Rgb([1, 0, 0]));
+        assert_eq!(*crop_square(&wide, 50).get_pixel(0, 0), Rgb([0, 1, 0]));
+        assert_eq!(*crop_square(&wide, 100).get_pixel(0, 0), Rgb([0, 0, 1]));
+        assert_eq!(crop_square(&wide, 100).dimensions(), (2, 2));
+
+        let mut tall = RgbImage::from_pixel(2, 6, Rgb([0, 0, 0]));
+        tall.put_pixel(0, 0, Rgb([1, 0, 0]));
+        tall.put_pixel(0, 4, Rgb([0, 0, 1]));
+        assert_eq!(*crop_square(&tall, 0).get_pixel(0, 0), Rgb([1, 0, 0]));
+        assert_eq!(*crop_square(&tall, 100).get_pixel(0, 0), Rgb([0, 0, 1]));
+    }
+
+    #[test]
+    fn square_gif_ignores_position() {
+        let image = RgbImage::from_pixel(4, 4, Rgb([9, 9, 9]));
+        assert_eq!(square_origin(4, 4, 0), (0, 0, 4));
+        assert_eq!(square_origin(4, 4, 100), (0, 0, 4));
+        assert_eq!(crop_square(&image, 100).dimensions(), (4, 4));
+    }
+
+    #[test]
+    fn position_accepts_a_percent_sign() {
+        assert_eq!(parse_position("0").unwrap(), 0);
+        assert_eq!(parse_position("50%").unwrap(), 50);
+        assert_eq!(parse_position("100").unwrap(), 100);
+        assert!(parse_position("101").is_err());
+        assert!(parse_position("left").is_err());
     }
 }
