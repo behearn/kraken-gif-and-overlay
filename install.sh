@@ -43,7 +43,7 @@ install -d -o "$user" -g "$group" "$data"
 systemctl daemon-reload
 systemctl enable kraken-gif-and-overlay.service
 
-if [ -f "$data/config" ]; then
+if [ -f "$data/config.yml" ]; then
     systemctl restart kraken-gif-and-overlay.service
     echo "Started kraken-gif-and-overlay for $user."
 else

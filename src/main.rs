@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use ab_glyph::{FontArc, PxScale, ScaleFont};
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use hidapi::HidDevice;
 use image::imageops::FilterType;
 use image::{AnimationDecoder, Rgb, RgbImage};
@@ -42,19 +43,43 @@ fn main() -> Result<()> {
     let flag = Arc::clone(&running);
     ctrlc::set_handler(move || flag.store(false, Ordering::Relaxed))?;
 
+    if (args.add || args.delete || args.update) && !args.save_config {
+        bail!("Pass --save-config with --add, --delete, or --update.");
+    }
+
     if args.list_sensors {
         print_sensors(&scan_sensors());
         return Ok(());
     }
 
-    let settings = load_settings(&args)?;
-    println!("Loading {}", settings.gif.display());
-    let frames = load_gif(&settings.gif, settings.position)?;
+    let Some(settings) = load_settings(&args)? else {
+        return Ok(());
+    };
+    let mut slides = Vec::with_capacity(settings.images.len());
+    for image in &settings.images {
+        println!("Loading {}", image.path.display());
+        slides.push(Slide {
+            frames: load_gif(&image.path, image.position)?,
+            boxes: image.boxes,
+            opacity: image.opacity,
+        });
+    }
     let font = load_font(&settings.font)?;
-    println!(
-        "Kraken 2023 Elite: {WIDTH}x{HEIGHT}, {} GIF frames, Q565 stream",
-        frames.len()
-    );
+    let frame_count: usize = slides.iter().map(|slide| slide.frames.len()).sum();
+    if slides.len() == 1 {
+        println!("Kraken 2023 Elite: {WIDTH}x{HEIGHT}, {frame_count} GIF frames, Q565 stream");
+    } else {
+        println!(
+            "Kraken 2023 Elite: {WIDTH}x{HEIGHT}, {} images, {frame_count} GIF frames, Q565 stream",
+            slides.len()
+        );
+        println!(
+            "Slideshow: {}s on each image, fade {}s, {}",
+            settings.hold.as_secs_f64(),
+            settings.fade.as_secs_f64(),
+            settings.order.as_str()
+        );
+    }
 
     let usb = rusb::Context::new().context("USB context")?;
     let mut bulk = open_kraken(&usb)?;
@@ -74,14 +99,36 @@ fn main() -> Result<()> {
         gpu_c: None,
         read_at: None,
     };
-    let mut index = 0usize;
+    let mut player = Player::new(slides, settings.hold, settings.fade, settings.order);
     let mut sent = 0u32;
     let mut window = Instant::now();
     let mut deadline = Instant::now();
 
     while running.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if player.poll(now) {
+            deadline = now;
+        }
+        let (frame_index, boxes, opacity) = {
+            let slide = &player.slides[player.index];
+            (player.frame, slide.boxes, slide.opacity)
+        };
+        let fade = player.opacity(now);
+        let frame = &player.slides[player.index].frames[frame_index];
+        let delay = frame.1;
         let (cpu, gpu) = sensors.get();
-        let composed = draw_overlay(&frames[index].0, cpu, gpu, &font, settings.overlay);
+        let composed = draw_overlay(
+            &frame.0,
+            cpu,
+            gpu,
+            &font,
+            Overlay {
+                boxes,
+                opacity,
+                color: settings.color,
+            },
+            fade,
+        );
         let payload = encode_q565(&composed)?;
         send_q565(&hid, &bulk, endpoint, &payload)?;
 
@@ -90,8 +137,13 @@ fn main() -> Result<()> {
             let now = Instant::now();
             if now.duration_since(window) >= Duration::from_secs(2) {
                 let secs = now.duration_since(window).as_secs_f32();
+                let image = if player.slides.len() > 1 {
+                    format!("  image {}/{}", player.index + 1, player.slides.len())
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{:.1} fps  CPU {}  GPU {}  frame {} KB",
+                    "{:.1} fps  CPU {}  GPU {}  frame {} KB{image}",
                     sent as f32 / secs,
                     format_temp(cpu, "°C"),
                     format_temp(gpu, "°C"),
@@ -102,8 +154,9 @@ fn main() -> Result<()> {
             }
         }
 
-        deadline += frames[index].1;
-        index = (index + 1) % frames.len();
+        deadline += delay;
+        let frame_count = player.slides[player.index].frames.len();
+        player.frame = (player.frame + 1) % frame_count;
         let now = Instant::now();
         if deadline > now {
             std::thread::sleep(deadline - now);
@@ -234,8 +287,14 @@ struct Args {
     debug: bool,
     list_sensors: bool,
     save_config: bool,
+    add: bool,
+    delete: bool,
+    update: bool,
     gif: Option<PathBuf>,
     position: Option<u8>,
+    duration: Option<f64>,
+    fade: Option<f64>,
+    order: Option<PlayOrder>,
     cpu_sensor: Option<String>,
     gpu_sensor: Option<String>,
     boxes: Option<bool>,
@@ -251,8 +310,14 @@ fn parse_args() -> Result<Args> {
         debug: false,
         list_sensors: false,
         save_config: false,
+        add: false,
+        delete: false,
+        update: false,
         gif: None,
         position: None,
+        duration: None,
+        fade: None,
+        order: None,
         cpu_sensor: None,
         gpu_sensor: None,
         boxes: None,
@@ -268,7 +333,30 @@ fn parse_args() -> Result<Args> {
             "--debug" => args.debug = true,
             "--list-sensors" => args.list_sensors = true,
             "--save-config" => args.save_config = true,
+            "--add" => args.add = true,
+            "--delete" => args.delete = true,
+            "--update" => args.update = true,
             "--gif" => args.gif = Some(PathBuf::from(next_arg(&mut rest, "--gif needs a path")?)),
+            "--duration" => {
+                args.duration = Some(parse_seconds(
+                    &next_arg(&mut rest, "--duration needs a number of seconds")?,
+                    "duration",
+                    false,
+                )?)
+            }
+            "--fade" => {
+                args.fade = Some(parse_seconds(
+                    &next_arg(&mut rest, "--fade needs a number of seconds")?,
+                    "fade",
+                    true,
+                )?)
+            }
+            "--order" => {
+                args.order = Some(parse_order(&next_arg(
+                    &mut rest,
+                    "--order needs sequential or random",
+                )?)?)
+            }
             "--position" => {
                 args.position = Some(parse_position(&next_arg(
                     &mut rest,
@@ -311,13 +399,19 @@ fn print_usage() {
         "\
 Usage: {program} [options]
 
-  --gif <path>           GIF to display
+  --gif <path>           GIF to display or save
   --position <0-100>     Square crop on a wide or tall GIF. 0 is left or top, 50 centers, 100 is right or bottom. Default: 50
-  --save-config          Copy --gif into the data directory and write config
+  --duration <seconds>   How long each image stays up when more than one is playing. Default: 120
+  --fade <seconds>       Fade in and fade out time between images. Default: 0.3
+  --order <mode>         sequential or random. Random never repeats the current image. Default: sequential
+  --save-config          Write config and exit. The first image is added. Later image changes need --add, --delete, or --update
+  --add                  Append --gif to the image list. Requires --save-config
+  --delete               Remove --gif from the image list. Requires --save-config
+  --update               Change the only configured image. Requires --save-config
   --cpu-sensor <id>      CPU temperature sensor. Default: auto
   --gpu-sensor <id>      GPU temperature sensor. Default: auto
-  --box <yes|no>         Draw boxes behind the text. Default: no
-  --opacity <0-255>      Box opacity. Default: 150
+  --box <yes|no>         Draw boxes behind the text on this image. Default: no
+  --opacity <0-255>      Box opacity for this image. Default: 150
   --color <RRGGBB>       Text colour. Default: f2f2f2
   --font <path>          .ttf font file
   --list-sensors         Print temperature sensors and exit
@@ -327,8 +421,10 @@ Usage: {program} [options]
     );
 }
 
+const CONFIG_FILE: &str = "config.yml";
+
 fn config_exists() -> Result<bool> {
-    Ok(data_dir()?.join("config").is_file())
+    Ok(data_dir()?.join(CONFIG_FILE).is_file())
 }
 
 fn load_gif(path: &Path, position: u8) -> Result<Vec<(RgbImage, Duration)>> {
@@ -383,8 +479,10 @@ fn draw_overlay(
     gpu: Option<f32>,
     font: &FontArc,
     overlay: Overlay,
+    fade: f32,
 ) -> RgbImage {
     let mut image = frame.clone();
+    apply_opacity(&mut image, fade);
     let temp_scale = PxScale::from(TEMP_PX);
     let label_scale = PxScale::from(LABEL_PX);
     let outer_pad = 28i32;
@@ -533,12 +631,291 @@ struct Overlay {
 }
 
 struct Settings {
-    gif: PathBuf,
-    position: u8,
+    images: Vec<RunnableImage>,
     font: PathBuf,
+    color: [u8; 3],
     cpu: PathBuf,
     gpu: PathBuf,
-    overlay: Overlay,
+    hold: Duration,
+    fade: Duration,
+    order: PlayOrder,
+}
+
+struct RunnableImage {
+    path: PathBuf,
+    position: u8,
+    boxes: bool,
+    opacity: u8,
+}
+
+struct Slide {
+    frames: Vec<(RgbImage, Duration)>,
+    boxes: bool,
+    opacity: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    In,
+    Hold,
+    Out,
+}
+
+struct Player {
+    slides: Vec<Slide>,
+    index: usize,
+    frame: usize,
+    phase: Phase,
+    phase_start: Instant,
+    hold: Duration,
+    fade: Duration,
+    order: PlayOrder,
+    rng: Rng,
+}
+
+impl Player {
+    fn new(slides: Vec<Slide>, hold: Duration, fade: Duration, order: PlayOrder) -> Self {
+        let fade_in = slides.len() > 1 && !fade.is_zero();
+        Self {
+            slides,
+            index: 0,
+            frame: 0,
+            phase: if fade_in { Phase::In } else { Phase::Hold },
+            phase_start: Instant::now(),
+            hold,
+            fade,
+            order,
+            rng: Rng::from_time(),
+        }
+    }
+
+    /// Advance the fade and, when the hold is over, the current image.
+    /// Returns true when the image changed.
+    fn poll(&mut self, now: Instant) -> bool {
+        if self.slides.len() < 2 || (self.hold.is_zero() && self.fade.is_zero()) {
+            return false;
+        }
+        let mut switched = false;
+        loop {
+            let elapsed = now.saturating_duration_since(self.phase_start);
+            match self.phase {
+                Phase::In if self.fade.is_zero() || elapsed >= self.fade => {
+                    self.phase = Phase::Hold;
+                    self.phase_start = now;
+                }
+                Phase::Hold if elapsed >= self.hold => {
+                    if self.fade.is_zero() {
+                        self.advance(now);
+                        switched = true;
+                    } else {
+                        self.phase = Phase::Out;
+                        self.phase_start = now;
+                    }
+                }
+                Phase::Out if elapsed >= self.fade => {
+                    self.advance(now);
+                    switched = true;
+                }
+                _ => break,
+            }
+        }
+        switched
+    }
+
+    fn advance(&mut self, now: Instant) {
+        self.index = next_slide(self.order, self.index, self.slides.len(), &mut self.rng);
+        self.frame = 0;
+        self.phase = if self.fade.is_zero() { Phase::Hold } else { Phase::In };
+        self.phase_start = now;
+    }
+
+    fn opacity(&self, now: Instant) -> f32 {
+        if self.slides.len() < 2 {
+            return 1.0;
+        }
+        phase_opacity(self.phase, now.saturating_duration_since(self.phase_start), self.fade)
+    }
+}
+
+fn phase_opacity(phase: Phase, elapsed: Duration, fade: Duration) -> f32 {
+    if fade.is_zero() {
+        return 1.0;
+    }
+    let ratio = elapsed.as_secs_f32() / fade.as_secs_f32();
+    match phase {
+        Phase::In => ratio.clamp(0.0, 1.0),
+        Phase::Hold => 1.0,
+        Phase::Out => (1.0 - ratio).clamp(0.0, 1.0),
+    }
+}
+
+fn next_slide(order: PlayOrder, current: usize, len: usize, rng: &mut Rng) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    match order {
+        PlayOrder::Sequential => (current + 1) % len,
+        PlayOrder::Random => {
+            let pick = (rng.next_u64() as usize) % (len - 1);
+            if pick < current { pick } else { pick + 1 }
+        }
+    }
+}
+
+fn apply_opacity(image: &mut RgbImage, opacity: f32) {
+    if opacity >= 1.0 {
+        return;
+    }
+    let factor = opacity.clamp(0.0, 1.0);
+    for pixel in image.pixels_mut() {
+        for channel in &mut pixel.0 {
+            *channel = (*channel as f32 * factor).round() as u8;
+        }
+    }
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn from_time() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0x5EED);
+        Self(seed | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+}
+
+const DEFAULT_DURATION: f64 = 120.0;
+const DEFAULT_FADE: f64 = 0.3;
+const DEFAULT_OPACITY: u8 = 150;
+const DEFAULT_POSITION: u8 = 50;
+
+fn default_duration() -> f64 {
+    DEFAULT_DURATION
+}
+
+fn default_fade() -> f64 {
+    DEFAULT_FADE
+}
+
+fn default_box_opacity() -> u8 {
+    DEFAULT_OPACITY
+}
+
+fn default_position() -> u8 {
+    DEFAULT_POSITION
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PlayOrder {
+    #[default]
+    Sequential,
+    Random,
+}
+
+impl PlayOrder {
+    fn as_str(self) -> &'static str {
+        match self {
+            PlayOrder::Sequential => "sequential",
+            PlayOrder::Random => "random",
+        }
+    }
+}
+
+impl Serialize for PlayOrder {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PlayOrder {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        parse_order(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    #[serde(default)]
+    sensors: SensorConfig,
+    #[serde(default)]
+    overlay: OverlayConfig,
+    #[serde(default)]
+    slideshow: SlideshowConfig,
+    #[serde(default)]
+    images: Vec<ImageConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SensorConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct OverlayConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    font: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SlideshowConfig {
+    #[serde(default = "default_duration", serialize_with = "serialize_seconds")]
+    duration: f64,
+    #[serde(default = "default_fade", serialize_with = "serialize_seconds")]
+    fade: f64,
+    #[serde(default)]
+    order: PlayOrder,
+}
+
+impl Default for SlideshowConfig {
+    fn default() -> Self {
+        Self {
+            duration: default_duration(),
+            fade: default_fade(),
+            order: PlayOrder::Sequential,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageConfig {
+    #[serde(rename = "gifPath")]
+    gif_path: String,
+    #[serde(default, rename = "box")]
+    boxes: bool,
+    #[serde(default = "default_box_opacity", rename = "boxOpacity")]
+    box_opacity: u8,
+    #[serde(default = "default_position")]
+    position: u8,
+}
+
+fn serialize_seconds<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+    if value.fract() == 0.0 && value.abs() < i64::MAX as f64 {
+        serializer.serialize_i64(*value as i64)
+    } else {
+        serializer.serialize_f64(*value)
+    }
 }
 
 const FONT_CANDIDATES: &[&str] = &[
@@ -563,95 +940,100 @@ const GPU_CHIPS: &[&str] = &["amdgpu", "nvidia", "nouveau", "i915", "xe"];
 const CPU_CHIPS: &[&str] = &["coretemp", "k10temp", "zenpower", "cpu_thermal"];
 const CPU_LABELS: &[&str] = &["Tctl", "Tdie", "Package id 0"];
 
-fn load_settings(args: &Args) -> Result<Settings> {
+fn load_settings(args: &Args) -> Result<Option<Settings>> {
     let dir = data_dir()?;
-    let config_path = dir.join("config");
-    let configured = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let configured = parse_config(&configured);
+    let config_path = dir.join(CONFIG_FILE);
+    let text = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let mut config = load_config_text(&text)?;
     let sensors = scan_sensors();
 
     let cpu = temperature_sensor(
         &sensors,
-        args.cpu_sensor.as_deref().or(configured.get("cpu").map(String::as_str)),
+        args.cpu_sensor.as_deref().or(config.sensors.cpu.as_deref()),
         pick_cpu,
         "CPU",
         "cpu-sensor",
     )?;
     let gpu = temperature_sensor(
         &sensors,
-        args.gpu_sensor.as_deref().or(configured.get("gpu").map(String::as_str)),
+        args.gpu_sensor.as_deref().or(config.sensors.gpu.as_deref()),
         pick_gpu,
         "GPU",
         "gpu-sensor",
     )?;
-    let cpu_id = cpu.id.clone();
-    let gpu_id = gpu.id.clone();
-    let cpu = cpu.path.clone();
-    let gpu = gpu.path.clone();
+    let cpu_path = cpu.path.clone();
+    let gpu_path = gpu.path.clone();
 
-    let copied_gif = if args.save_config {
+    if args.save_config {
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        let gif_name = match args.gif.as_deref() {
-            Some(source) => Some(copy_gif_into(&dir, source)?),
-            None => configured.get("gif").cloned(),
-        };
-        let run_gif = if args.gif.is_some() {
-            gif_name.clone().map(|name| dir.join(name))
-        } else {
-            None
-        };
-        let mut updates = Vec::new();
-        if let Some(name) = gif_name {
-            updates.push(("gif", name));
-        }
-        updates.push(("cpu", cpu_id));
-        updates.push(("gpu", gpu_id));
-        if let Some(position) = args.position {
-            updates.push(("position", position.to_string()));
-        }
-        if let Some(boxes) = args.boxes {
-            updates.push(("box", if boxes { "yes".to_string() } else { "no".to_string() }));
-        }
-        if let Some(opacity) = args.opacity {
-            updates.push(("opacity", opacity.to_string()));
-        }
-        if let Some(color) = args.color {
-            updates.push(("color", format!("{:02x}{:02x}{:02x}", color[0], color[1], color[2])));
-        }
-        if let Some(font) = &args.font {
-            updates.push(("font", font_config_value(&dir, font)?));
-        }
-        upsert_config(&config_path, &updates)?;
-        run_gif
-    } else {
-        None
-    };
+        apply_save(&dir, &mut config, args, &cpu.id, &gpu.id)?;
+        write_config(&config_path, &config)?;
+        return Ok(None);
+    }
 
-    let gif = if let Some(path) = copied_gif {
-        path
-    } else if let Some(path) = &args.gif {
-        if !path.is_file() {
-            bail!("GIF not found: {}", path.display());
-        }
-        path.clone()
-    } else {
-        gif_path(&dir, configured.get("gif").map(String::as_str))?
-    };
+    let images = images_for_run(&dir, &config, args)?;
+    if images.len() > 1 && args.duration.unwrap_or(config.slideshow.duration) <= 0.0 {
+        bail!("Set slideshow duration above 0 seconds when more than one image is configured.");
+    }
     let font = if let Some(path) = &args.font {
         path.clone()
     } else {
-        font_path(&dir, configured.get("font").map(String::as_str))?
+        font_path(&dir, config.overlay.font.as_deref())?
     };
-    let position = chosen(args.position, configured.get("position"), parse_position, 50)?;
-    let overlay = overlay_from(&configured, args)?;
-    Ok(Settings {
-        gif,
-        position,
+    let color = if let Some(color) = args.color {
+        color
+    } else if let Some(color) = config.overlay.color.as_deref() {
+        parse_color(color)?
+    } else {
+        [242, 242, 242]
+    };
+    Ok(Some(Settings {
+        images,
         font,
-        cpu,
-        gpu,
-        overlay,
-    })
+        color,
+        cpu: cpu_path,
+        gpu: gpu_path,
+        hold: seconds(args.duration.unwrap_or(config.slideshow.duration), "duration")?,
+        fade: seconds(args.fade.unwrap_or(config.slideshow.fade), "fade")?,
+        order: args.order.unwrap_or(config.slideshow.order),
+    }))
+}
+
+fn images_for_run(dir: &Path, config: &Config, args: &Args) -> Result<Vec<RunnableImage>> {
+    if args.gif.is_some() && !args.save_config {
+        let path = args.gif.clone().context("Pass --gif <path> to configure a GIF.")?;
+        if !path.is_file() {
+            bail!("GIF not found: {}", path.display());
+        }
+        return Ok(vec![RunnableImage {
+            path,
+            position: args.position.unwrap_or(DEFAULT_POSITION),
+            boxes: args.boxes.unwrap_or(false),
+            opacity: args.opacity.unwrap_or(DEFAULT_OPACITY),
+        }]);
+    }
+    if config.images.is_empty() {
+        bail!("Pass --gif <path> to configure a GIF.");
+    }
+    config
+        .images
+        .iter()
+        .map(|image| {
+            let path = in_data_dir(dir, &image.gif_path);
+            if !path.is_file() {
+                bail!("GIF not found: {}", path.display());
+            }
+            if image.position > 100 {
+                bail!("position must be a percentage from 0 to 100");
+            }
+            Ok(RunnableImage {
+                path,
+                position: image.position,
+                boxes: image.boxes,
+                opacity: image.box_opacity,
+            })
+        })
+        .collect()
 }
 
 fn font_path(dir: &Path, configured: Option<&str>) -> Result<PathBuf> {
@@ -669,29 +1051,6 @@ fn font_path(dir: &Path, configured: Option<&str>) -> Result<PathBuf> {
         .context("No DejaVu Sans or Noto Sans Bold font was found. Set font in the config to a .ttf file.")
 }
 
-fn overlay_from(configured: &std::collections::HashMap<String, String>, args: &Args) -> Result<Overlay> {
-    Ok(Overlay {
-        boxes: chosen(args.boxes, configured.get("box"), parse_bool, false)?,
-        opacity: chosen(args.opacity, configured.get("opacity"), parse_opacity, 150)?,
-        color: chosen(args.color, configured.get("color"), parse_color, [242, 242, 242])?,
-    })
-}
-
-fn chosen<T>(
-    from_arg: Option<T>,
-    from_config: Option<&String>,
-    parse: fn(&str) -> Result<T>,
-    default: T,
-) -> Result<T> {
-    if let Some(value) = from_arg {
-        return Ok(value);
-    }
-    match from_config {
-        Some(value) => parse(value),
-        None => Ok(default),
-    }
-}
-
 fn parse_position(value: &str) -> Result<u8> {
     let text = value.trim().trim_end_matches('%').trim();
     let number: u8 = text
@@ -701,6 +1060,35 @@ fn parse_position(value: &str) -> Result<u8> {
         bail!("position must be a percentage from 0 to 100");
     }
     Ok(number)
+}
+
+fn parse_seconds(value: &str, name: &str, allow_zero: bool) -> Result<f64> {
+    let number: f64 = value
+        .trim()
+        .parse()
+        .with_context(|| format!("{name} must be a number of seconds"))?;
+    if !number.is_finite() || number < 0.0 || (!allow_zero && number == 0.0) {
+        if allow_zero {
+            bail!("{name} must be zero seconds or more");
+        }
+        bail!("{name} must be more than zero seconds");
+    }
+    Ok(number)
+}
+
+fn seconds(value: f64, name: &str) -> Result<Duration> {
+    if !value.is_finite() || value < 0.0 {
+        bail!("{name} must be a number of seconds");
+    }
+    Duration::try_from_secs_f64(value).with_context(|| format!("{name} must be a number of seconds"))
+}
+
+fn parse_order(value: &str) -> Result<PlayOrder> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "sequential" => Ok(PlayOrder::Sequential),
+        "random" => Ok(PlayOrder::Random),
+        _ => bail!("order must be sequential or random"),
+    }
 }
 
 fn parse_bool(value: &str) -> Result<bool> {
@@ -768,42 +1156,218 @@ fn font_config_value(dir: &Path, path: &Path) -> Result<String> {
     Ok(relative_to(dir, &absolute))
 }
 
-fn upsert_config(path: &Path, updates: &[(&str, String)]) -> Result<()> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
-    let mut seen = vec![false; updates.len()];
-    for line in &mut lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((key, _)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        if let Some(index) = updates.iter().position(|(name, _)| *name == key) {
-            *line = format!("{} = {}", updates[index].0, updates[index].1);
-            seen[index] = true;
-        }
-    }
-    for (index, (key, value)) in updates.iter().enumerate() {
-        if !seen[index] {
-            lines.push(format!("{key} = {value}"));
-        }
-    }
-    store_config(path, &lines)
+#[derive(Clone, Copy)]
+struct SaveFlags {
+    gif: bool,
+    position: bool,
+    boxes: bool,
+    opacity: bool,
+    add: bool,
+    delete: bool,
+    update: bool,
 }
 
-fn store_config(path: &Path, lines: &[String]) -> Result<()> {
-    let text = if lines.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", lines.join("\n"))
+impl SaveFlags {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            gif: args.gif.is_some(),
+            position: args.position.is_some(),
+            boxes: args.boxes.is_some(),
+            opacity: args.opacity.is_some(),
+            add: args.add,
+            delete: args.delete,
+            update: args.update,
+        }
+    }
+
+    fn touches_image(self) -> bool {
+        self.gif || self.position || self.boxes || self.opacity || self.add || self.delete || self.update
+    }
+}
+
+#[derive(Debug)]
+enum SavePlan {
+    GlobalsOnly,
+    Add,
+    Delete,
+    Update,
+}
+
+fn save_plan(image_count: usize, flags: SaveFlags) -> Result<SavePlan> {
+    let verbs = [flags.add, flags.delete, flags.update].iter().filter(|flag| **flag).count();
+    if verbs > 1 {
+        bail!("Pass only one of --add, --delete, or --update.");
+    }
+    if image_count == 0 {
+        if flags.delete {
+            bail!("No image is configured to delete.");
+        }
+        if flags.update {
+            bail!("No image is configured to update.");
+        }
+        if !flags.gif {
+            bail!("Pass --gif <path> to add an image.");
+        }
+        return Ok(SavePlan::Add);
+    }
+    if verbs == 0 {
+        if flags.touches_image() {
+            if image_count == 1 {
+                bail!("An image is already configured. Include --add, --delete, or --update.");
+            }
+            bail!("Images are already configured. Include --add or --delete.");
+        }
+        return Ok(SavePlan::GlobalsOnly);
+    }
+    if flags.update && image_count != 1 {
+        bail!("--update only applies when a single image is configured. Include --add or --delete.");
+    }
+    if flags.add && !flags.gif {
+        bail!("Pass --gif <path> to add an image.");
+    }
+    if flags.add {
+        return Ok(SavePlan::Add);
+    }
+    if flags.delete {
+        return Ok(SavePlan::Delete);
+    }
+    Ok(SavePlan::Update)
+}
+
+fn apply_save(dir: &Path, config: &mut Config, args: &Args, cpu_id: &str, gpu_id: &str) -> Result<()> {
+    let plan = save_plan(config.images.len(), SaveFlags::from_args(args))?;
+    config.sensors.cpu = Some(cpu_id.to_string());
+    config.sensors.gpu = Some(gpu_id.to_string());
+    if let Some(color) = args.color {
+        config.overlay.color = Some(format!("{:02x}{:02x}{:02x}", color[0], color[1], color[2]));
+    } else if config.overlay.color.is_none() {
+        config.overlay.color = Some("f2f2f2".to_string());
+    }
+    if let Some(font) = &args.font {
+        config.overlay.font = Some(font_config_value(dir, font)?);
+    }
+    if let Some(duration) = args.duration {
+        config.slideshow.duration = duration;
+    }
+    if let Some(fade) = args.fade {
+        config.slideshow.fade = fade;
+    }
+    if let Some(order) = args.order {
+        config.slideshow.order = order;
+    }
+    match plan {
+        SavePlan::GlobalsOnly => {}
+        SavePlan::Add => {
+            let image = new_image(dir, args, &config.images)?;
+            config.images.push(image);
+        }
+        SavePlan::Delete => delete_image(config, args.gif.as_deref())?,
+        SavePlan::Update => update_image(dir, &mut config.images[0], args)?,
+    }
+    validate_config(config)
+}
+
+fn new_image(dir: &Path, args: &Args, existing: &[ImageConfig]) -> Result<ImageConfig> {
+    let source = args.gif.as_deref().context("Pass --gif <path> to add an image.")?;
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("GIF file name is not valid text")?;
+    if existing.iter().any(|image| file_name(&image.gif_path) == name) {
+        bail!("{name} is already in the image list. Include --delete to remove it.");
+    }
+    Ok(ImageConfig {
+        gif_path: copy_gif_into(dir, source)?,
+        boxes: args.boxes.unwrap_or(false),
+        box_opacity: args.opacity.unwrap_or(DEFAULT_OPACITY),
+        position: args.position.unwrap_or(DEFAULT_POSITION),
+    })
+}
+
+fn update_image(dir: &Path, image: &mut ImageConfig, args: &Args) -> Result<()> {
+    if let Some(source) = &args.gif {
+        image.gif_path = copy_gif_into(dir, source)?;
+    }
+    if let Some(boxes) = args.boxes {
+        image.boxes = boxes;
+    }
+    if let Some(opacity) = args.opacity {
+        image.box_opacity = opacity;
+    }
+    if let Some(position) = args.position {
+        image.position = position;
+    }
+    Ok(())
+}
+
+fn delete_image(config: &mut Config, gif: Option<&Path>) -> Result<()> {
+    let Some(gif) = gif else {
+        if config.images.len() == 1 {
+            config.images.clear();
+            return Ok(());
+        }
+        bail!("Pass --gif <path> to choose which image to delete.");
     };
+    let name = gif
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("GIF file name is not valid text")?;
+    let before = config.images.len();
+    config.images.retain(|image| {
+        file_name(&image.gif_path) != name && image.gif_path != gif.display().to_string()
+    });
+    if config.images.len() == before {
+        bail!("No configured image matches {name}.");
+    }
+    Ok(())
+}
+
+fn file_name(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+}
+
+fn write_config(path: &Path, config: &Config) -> Result<()> {
+    let mut text = serde_yaml::to_string(config).context("Could not write config")?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
     std::fs::write(path, &text).with_context(|| format!("write {}", path.display()))?;
-    println!();
-    println!("Wrote {}:", path.display());
-    print!("{text}");
+    println!("Wrote {}", path.display());
+    println!("Restart the service for the change to apply:");
+    println!("  sudo systemctl restart kraken-gif-and-overlay");
+    Ok(())
+}
+
+fn load_config_text(text: &str) -> Result<Config> {
+    if text.trim().is_empty() {
+        return Ok(Config::default());
+    }
+    let config = serde_yaml::from_str(text).context("Could not read config")?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<()> {
+    if !config.slideshow.duration.is_finite() || config.slideshow.duration < 0.0 {
+        bail!("duration must be a number of seconds");
+    }
+    if !config.slideshow.fade.is_finite() || config.slideshow.fade < 0.0 {
+        bail!("fade must be a number of seconds");
+    }
+    for image in &config.images {
+        if image.gif_path.trim().is_empty() {
+            bail!("gifPath is empty");
+        }
+        if image.position > 100 {
+            bail!("position must be a percentage from 0 to 100");
+        }
+    }
+    if let Some(color) = &config.overlay.color {
+        parse_color(color)?;
+    }
     Ok(())
 }
 
@@ -822,64 +1386,6 @@ fn data_dir() -> Result<PathBuf> {
     }
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".local/share/kraken-gif-and-overlay"))
-}
-
-fn parse_config(text: &str) -> std::collections::HashMap<String, String> {
-    let mut values = std::collections::HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        values.insert(key.trim().to_string(), value.trim().to_string());
-    }
-    values
-}
-
-fn gif_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut gifs = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let is_gif = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"));
-        if is_gif {
-            gifs.push(path);
-        }
-    }
-    gifs.sort();
-    Ok(gifs)
-}
-
-fn gif_path(dir: &Path, configured: Option<&str>) -> Result<PathBuf> {
-    if let Some(name) = configured {
-        let path = in_data_dir(dir, name);
-        if !path.is_file() {
-            bail!("GIF not found: {}", path.display());
-        }
-        return Ok(path);
-    }
-    match gif_files(dir)?.as_slice() {
-        [only] => Ok(only.clone()),
-        [] => bail!("Pass --gif <path> to configure a GIF."),
-        gifs => {
-            println!("GIFs in {}:", dir.display());
-            for gif in gifs {
-                if let Some(name) = gif.file_name().and_then(|name| name.to_str()) {
-                    println!("  gif = {name}");
-                }
-            }
-            bail!("Set gif in the config to one of those files.");
-        }
-    }
 }
 
 fn print_sensors(sensors: &[Sensor]) {
@@ -1133,5 +1639,117 @@ mod crop {
         assert_eq!(parse_position("100").unwrap(), 100);
         assert!(parse_position("101").is_err());
         assert!(parse_position("left").is_err());
+    }
+}
+
+#[cfg(test)]
+mod slideshow {
+    use super::*;
+
+    fn flags(gif: bool, add: bool, delete: bool, update: bool) -> SaveFlags {
+        SaveFlags {
+            gif,
+            position: false,
+            boxes: false,
+            opacity: false,
+            add,
+            delete,
+            update,
+        }
+    }
+
+    #[test]
+    fn first_image_is_added_and_later_ones_need_a_verb() {
+        assert!(matches!(save_plan(0, flags(true, false, false, false)).unwrap(), SavePlan::Add));
+
+        let one = format!("{}", save_plan(1, flags(true, false, false, false)).unwrap_err());
+        assert!(one.contains("--add"));
+        assert!(one.contains("--delete"));
+        assert!(one.contains("--update"));
+
+        let many = format!("{}", save_plan(2, flags(true, false, false, false)).unwrap_err());
+        assert!(many.contains("--add"));
+        assert!(many.contains("--delete"));
+        assert!(!many.contains("--update"));
+
+        let update = format!("{}", save_plan(2, flags(false, false, false, true)).unwrap_err());
+        assert!(update.contains("--update"));
+        assert!(matches!(save_plan(2, flags(false, false, false, false)).unwrap(), SavePlan::GlobalsOnly));
+        assert!(matches!(save_plan(1, flags(true, true, false, false)).unwrap(), SavePlan::Add));
+    }
+
+    #[test]
+    fn order_walks_in_sequence_or_picks_a_different_image() {
+        let mut rng = Rng(1);
+        assert_eq!(next_slide(PlayOrder::Sequential, 0, 3, &mut rng), 1);
+        assert_eq!(next_slide(PlayOrder::Sequential, 2, 3, &mut rng), 0);
+        assert_eq!(next_slide(PlayOrder::Random, 0, 2, &mut rng), 1);
+        for _ in 0..40 {
+            let next = next_slide(PlayOrder::Random, 1, 4, &mut rng);
+            assert_ne!(next, 1);
+            assert!(next < 4);
+        }
+    }
+
+    #[test]
+    fn fade_ramps_in_and_out() {
+        let fade = Duration::from_secs(1);
+        assert_eq!(phase_opacity(Phase::In, Duration::ZERO, fade), 0.0);
+        assert!((phase_opacity(Phase::In, Duration::from_millis(500), fade) - 0.5).abs() < 0.01);
+        assert!((phase_opacity(Phase::Out, Duration::from_millis(500), fade) - 0.5).abs() < 0.01);
+        assert_eq!(phase_opacity(Phase::Hold, Duration::from_millis(500), fade), 1.0);
+        assert_eq!(phase_opacity(Phase::In, Duration::from_secs(1), Duration::ZERO), 1.0);
+    }
+
+    #[test]
+    fn config_round_trip_keeps_the_image_list() {
+        let config = Config {
+            sensors: SensorConfig {
+                cpu: Some("k10temp:Tctl".to_string()),
+                gpu: Some("amdgpu:edge".to_string()),
+            },
+            overlay: OverlayConfig {
+                font: None,
+                color: Some("f2f2f2".to_string()),
+            },
+            slideshow: SlideshowConfig {
+                duration: 12.0,
+                fade: 1.5,
+                order: PlayOrder::Random,
+            },
+            images: vec![
+                ImageConfig {
+                    gif_path: "one.gif".to_string(),
+                    boxes: false,
+                    box_opacity: 150,
+                    position: 0,
+                },
+                ImageConfig {
+                    gif_path: "two.gif".to_string(),
+                    boxes: true,
+                    box_opacity: 80,
+                    position: 100,
+                },
+            ],
+        };
+        let text = serde_yaml::to_string(&config).unwrap();
+        assert!(text.contains("gifPath"));
+        assert!(text.contains("boxOpacity"));
+        let parsed = load_config_text(&text).unwrap();
+        assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn a_short_image_entry_uses_defaults() {
+        let config = load_config_text("images:\n- gifPath: one.gif\n").unwrap();
+        assert!(!config.images[0].boxes);
+        assert_eq!(config.images[0].box_opacity, 150);
+        assert_eq!(config.images[0].position, 50);
+        assert_eq!(config.slideshow.order, PlayOrder::Sequential);
+        assert_eq!(config.slideshow.duration, 120.0);
+        assert_eq!(config.slideshow.fade, 0.3);
+        let text = serde_yaml::to_string(&config.slideshow).unwrap();
+        assert!(text.contains("duration: 120"), "{text}");
+        assert!(text.contains("fade: 0.3\n") || text.contains("fade: 0.3\r\n"), "{text}");
     }
 }

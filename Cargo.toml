@@ -14,3 +14,5 @@ image = { version = "0.25", default-features = false, features = ["gif"] }
 imageproc = "0.25"
 q565 = "0.4"
 rusb = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"

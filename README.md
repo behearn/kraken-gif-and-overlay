@@ -9,16 +9,22 @@ Ctrl+C switches the panel back to the liquid-temperature screen. If another prog
 ## Switches
 
 ```
---gif <path>           GIF to display
+--gif <path>           GIF to display or save
 --position <0-100>     Square crop on a wide or tall GIF. 0 is left or top, 50 centers, 100 is right or bottom. Default: 50
+--duration <seconds>   How long each image stays up when more than one is playing. Default: 120
+--fade <seconds>       Fade in and fade out time between images. Default: 0.3
+--order <mode>         sequential or random. Random never repeats the current image. Default: sequential
+--save-config          Write config and exit. The first image is added. Later image changes need --add, --delete, or --update
+--add                  Append --gif to the image list. Requires --save-config
+--delete               Remove --gif from the image list. Requires --save-config
+--update               Change the only configured image. Requires --save-config
 --cpu-sensor <id>      CPU temperature sensor. Default: auto
 --gpu-sensor <id>      GPU temperature sensor. Default: auto
 --list-sensors         Print temperature sensors and exit
---box <yes|no>         Draw boxes behind the text. Default: no
---opacity <0-255>      Box opacity. Default: 150
+--box <yes|no>         Draw boxes behind the text on this image. Default: no
+--opacity <0-255>      Box opacity for this image. Default: 150
 --color <RRGGBB>       Text colour. Default: f2f2f2
 --font <path>          .ttf font file
---save-config          Copy --gif into the data directory and write config
 --debug                Print frame stats about every two seconds
 --help                 Show this help
 ```
@@ -44,27 +50,44 @@ CPU and GPU temperatures are detected automatically. The CPU sensor is `Tctl`, `
 /usr/local/bin/kraken-gif-and-overlay --list-sensors
 ```
 
-`--save-config` copies the GIF into `~/.local/share/kraken-gif-and-overlay/` and writes `config` there. Keys already in the file are kept. The service reads that config and does not take switches.
+`--save-config` copies the GIF into `~/.local/share/kraken-gif-and-overlay/`, writes `config.yml`, and exits. The first save adds the image. Once an image is in the list, saving another image change needs `--add`, `--delete`, or, when only one image is configured, `--update`. Slideshow, sensor, and text settings can be saved on their own. The service reads that config and does not take switches.
 
 ```bash
 /usr/local/bin/kraken-gif-and-overlay --gif <path> --save-config
-/usr/local/bin/kraken-gif-and-overlay --cpu-sensor <id> --gpu-sensor <id> --save-config
+/usr/local/bin/kraken-gif-and-overlay --gif <path> --position 0 --box yes --opacity 180 --save-config --add
+/usr/local/bin/kraken-gif-and-overlay --gif <path> --save-config --delete
+/usr/local/bin/kraken-gif-and-overlay --position 100 --save-config --update
+/usr/local/bin/kraken-gif-and-overlay --duration 15 --fade 1 --order random --save-config
 ```
 
-A GIF that is not square is cropped to its shorter side, then scaled, so a circle stays a circle. `--position` slides that square along the longer side: `0` keeps the left or top, `100` keeps the right or bottom, and `50` (the default) centers it.
+When more than one image is configured, they rotate. `--duration` is how many seconds each image stays up. `--fade` is how long the GIF takes to fade in from black and out to black. The temperatures stay at full strength. `--order sequential` follows the list. `--order random` picks any image except the one on screen. A single image loops, and duration and fade are ignored.
 
-Pass `--position` or the overlay switches with `--save-config` to store them too. `box` is `yes` or `no`. `opacity` is 0–255 and applies to the dark boxes behind the text. `color` is `RRGGBB` or `r,g,b`. The default colour is off-white `f2f2f2`. `font` is a `.ttf` file. When it is unset, DejaVu Sans Bold is used, then Noto Sans Bold.
+A GIF that is not square is cropped to its shorter side, then scaled, so a circle stays a circle. `--position` slides that square along the longer side: `0` keeps the left or top, `100` keeps the right or bottom, and `50` (the default) centers it. Position, box, and box opacity are stored on each image.
+
+`color` is `RRGGBB` or `r,g,b`. The default colour is off-white `f2f2f2`. `font` is a `.ttf` file. When it is unset, DejaVu Sans Bold is used, then Noto Sans Bold. Colour and font apply to every image.
 
 ```bash
-/usr/local/bin/kraken-gif-and-overlay --box yes --opacity 150 --color f2f2f2 --font /usr/share/fonts/TTF/DejaVuSans-Bold.ttf --save-config
+/usr/local/bin/kraken-gif-and-overlay --color f2f2f2 --font /usr/share/fonts/TTF/DejaVuSans-Bold.ttf --save-config
 ```
 
-Example `config`:
+Example `config.yml`:
 
-```
-gif = cat-jam.gif
-cpu = k10temp:Tctl
-gpu = amdgpu:edge@0000:03:00.0
+```yaml
+sensors:
+  cpu: k10temp:Tctl
+  gpu: amdgpu:edge@0000:03:00.0
+overlay:
+  font: /usr/share/fonts/TTF/DejaVuSans-Bold.ttf
+  color: f2f2f2
+slideshow:
+  duration: 120
+  fade: 0.3
+  order: sequential
+images:
+  - gifPath: cat-jam.gif
+    box: false
+    boxOpacity: 150
+    position: 50
 ```
 
 ## Build
@@ -83,7 +106,7 @@ cargo run --release -- --gif <path>
 
 ## Install as a system service
 
-`./install.sh` asks for sudo. It installs the binary to `/usr/local/bin/kraken-gif-and-overlay`, enables a systemd service for the user who ran it, and adds a udev rule so that user can open the Kraken at boot. The service reads that user's `~/.local/share/kraken-gif-and-overlay/config` and does not load shell startup files. Save a config before the service will start.
+`./install.sh` asks for sudo. It installs the binary to `/usr/local/bin/kraken-gif-and-overlay`, enables a systemd service for the user who ran it, and adds a udev rule so that user can open the Kraken at boot. The service reads that user's `~/.local/share/kraken-gif-and-overlay/config.yml` and does not load shell startup files. Save a config before the service will start.
 
 ```bash
 ./build.sh
