@@ -139,6 +139,15 @@ sudo systemctl reset-failed kraken-gif-and-overlay
 sudo systemctl start kraken-gif-and-overlay
 ```
 
+## Known issues
+
+Dropped frames, or the panel flashing back to the liquid temperature for a moment, usually means another program still has the cooler. CoolerControl and CoolerDash do this when they are still installed: stopping this service hands the screen back to them, and while both are running the GIF stutters. `coolercontrold` restarts itself, so stopping the process is not enough.
+
+```bash
+systemctl status coolercontrold coolerdash cc-plugin-coolerdash coolercontrol-lcd-recover.timer
+sudo systemctl disable --now coolercontrold.service coolerdash.service cc-plugin-coolerdash.service coolercontrol-lcd-recover.timer
+```
+
 ## License
 
 The program is MIT. See [LICENSE](LICENSE).
