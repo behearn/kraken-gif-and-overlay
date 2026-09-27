@@ -1,0 +1,16 @@
+[package]
+name = "kraken-gif-and-overlay"
+version = "0.1.0"
+edition = "2021"
+description = "Stream a GIF and temperature overlay to an NZXT Kraken 2023 Elite"
+license = "MIT"
+
+[dependencies]
+ab_glyph = "0.2"
+anyhow = "1"
+ctrlc = "3.4"
+hidapi = "2"
+image = { version = "0.25", default-features = false, features = ["gif"] }
+imageproc = "0.25"
+q565 = "0.4"
+rusb = "0.9"

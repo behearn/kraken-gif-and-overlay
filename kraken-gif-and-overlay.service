@@ -1,0 +1,21 @@
+[Unit]
+Description=NZXT Kraken 2023 Elite GIF and temperature overlay
+After=systemd-udevd.service
+Wants=systemd-udevd.service
+StartLimitIntervalSec=120
+StartLimitBurst=8
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+Environment=HOME=@HOME@
+ExecStart=/usr/local/bin/kraken-gif-and-overlay
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kraken-gif-and-overlay
+
+[Install]
+WantedBy=multi-user.target
