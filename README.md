@@ -21,6 +21,7 @@ Ctrl+C switches the panel back to the liquid-temperature screen. If another prog
 --cpu-sensor <id>      CPU temperature sensor. Default: auto
 --gpu-sensor <id>      GPU temperature sensor. Default: auto
 --list-sensors         Print temperature sensors and exit
+--reset                Restore the liquid temperature screen and exit
 --box <yes|no>         Draw boxes behind the text on this image. Default: no
 --opacity <0-255>      Box opacity for this image. Default: 150
 --color <RRGGBB>       Text colour. Default: f2f2f2
@@ -113,7 +114,16 @@ cargo run --release -- --gif <path>
 ./install.sh
 ```
 
-`sudo systemctl stop kraken-gif-and-overlay` restores the liquid temperature screen.
+`sudo systemctl stop kraken-gif-and-overlay` sends SIGTERM. The program catches that, the same way it catches Ctrl+C, and switches the panel back to the liquid temperature screen.
+
+If the process was killed and the GIF is still on the panel, stop the service and then force the liquid screen:
+
+```bash
+sudo systemctl stop kraken-gif-and-overlay
+/usr/local/bin/kraken-gif-and-overlay --reset
+```
+
+`sudo systemctl kill --signal=SIGINT kraken-gif-and-overlay` is the other way to ask the running process to exit. It sends the Ctrl+C signal and does not follow it with SIGKILL.
 
 Stdout and stderr go to the journal. Recent lines, and a follow that stays open:
 

@@ -25,6 +25,7 @@ const NZXT_VID: u16 = 0x1E71;
 const ELITE_PID: u16 = 0x300C;
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 640;
+const LIQUID_SCREEN: [u8; 4] = [0x38, 0x01, 0x02, 0x00];
 const BULK_MAGIC: [u8; 12] = [
     0x12, 0xFA, 0x01, 0xE8, 0xAB, 0xCD, 0xEF, 0x98, 0x76, 0x54, 0x32, 0x10,
 ];
@@ -39,13 +40,17 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let running = Arc::new(AtomicBool::new(true));
-    let flag = Arc::clone(&running);
-    ctrlc::set_handler(move || flag.store(false, Ordering::Relaxed))?;
-
     if (args.add || args.delete || args.update) && !args.save_config {
         bail!("Pass --save-config with --add, --delete, or --update.");
     }
+
+    if args.reset {
+        return reset_liquid();
+    }
+
+    let running = Arc::new(AtomicBool::new(true));
+    let flag = Arc::clone(&running);
+    ctrlc::set_handler(move || flag.store(false, Ordering::Relaxed))?;
 
     if args.list_sensors {
         print_sensors(&scan_sensors());
@@ -159,7 +164,7 @@ fn main() -> Result<()> {
         player.frame = (player.frame + 1) % frame_count;
         let now = Instant::now();
         if deadline > now {
-            std::thread::sleep(deadline - now);
+            wait_until(&running, deadline);
         } else {
             deadline = now;
         }
@@ -173,7 +178,7 @@ struct LiquidRestore<'a> {
 
 impl Drop for LiquidRestore<'_> {
     fn drop(&mut self) {
-        if hid_write(self.hid, &[0x38, 0x01, 0x02, 0x00]).is_ok() {
+        if hid_write(self.hid, &LIQUID_SCREEN).is_ok() {
             println!("Restored the liquid temperature screen");
         } else {
             println!("Could not restore the liquid temperature screen");
@@ -281,11 +286,33 @@ fn wait_hid_prefix(device: &HidDevice, prefix: [u8; 2], timeout_ms: u64) -> bool
     false
 }
 
+fn wait_until(running: &AtomicBool, deadline: Instant) {
+    while running.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if deadline <= now {
+            return;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+    }
+}
+
+fn reset_liquid() -> Result<()> {
+    let hid_api = hidapi::HidApi::new()?;
+    let hid = hid_api
+        .open(NZXT_VID, ELITE_PID)
+        .map_err(hid_busy)
+        .context("Stop kraken-gif-and-overlay before --reset")?;
+    hid_write(&hid, &LIQUID_SCREEN)?;
+    println!("Restored the liquid temperature screen");
+    Ok(())
+}
+
 struct Args {
     any: bool,
     help: bool,
     debug: bool,
     list_sensors: bool,
+    reset: bool,
     save_config: bool,
     add: bool,
     delete: bool,
@@ -309,6 +336,7 @@ fn parse_args() -> Result<Args> {
         help: false,
         debug: false,
         list_sensors: false,
+        reset: false,
         save_config: false,
         add: false,
         delete: false,
@@ -332,6 +360,7 @@ fn parse_args() -> Result<Args> {
             "--help" => args.help = true,
             "--debug" => args.debug = true,
             "--list-sensors" => args.list_sensors = true,
+            "--reset" => args.reset = true,
             "--save-config" => args.save_config = true,
             "--add" => args.add = true,
             "--delete" => args.delete = true,
@@ -415,6 +444,7 @@ Usage: {program} [options]
   --color <RRGGBB>       Text colour. Default: f2f2f2
   --font <path>          .ttf font file
   --list-sensors         Print temperature sensors and exit
+  --reset                Restore the liquid temperature screen and exit
   --debug                Print frame stats about every two seconds
   --help                 Show this help
 "

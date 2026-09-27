@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 ab_glyph = "0.2"
 anyhow = "1"
-ctrlc = "3.4"
+ctrlc = { version = "3.4", features = ["termination"] }
 hidapi = "2"
 image = { version = "0.25", default-features = false, features = ["gif"] }
 imageproc = "0.25"
