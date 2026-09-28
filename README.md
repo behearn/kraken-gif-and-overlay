@@ -1,24 +1,19 @@
 # kraken-gif-and-overlay
 
-Streams a GIF with a CPU and GPU temperature overlay to the **NZXT Kraken 2023 Elite** (USB `1e71:300c`) on Linux. 
+Streams a GIF with a CPU and GPU temperature overlay to the **NZXT Kraken 2023 Elite** (USB `1e71:300c`) on Linux. Approximates the Dual Infographic + GIF setting in NZXT CAM.
 
 This was written because liquidctl (which lists this cooler as `NZXT Kraken 2023 Elite (broken)`), and CoolerControl with the CoolerDash plugin, cannot (at time of writing) stream a GIF and apply an overlay on that model.
 
 Ctrl+C switches the panel back to the liquid-temperature screen. If another program already has the cooler open, the streamer exits.
 
-## Compatibility
+## Quick start
 
-This was written for, and tested only on, the **NZXT Kraken 2023 Elite** (USB `1e71:300c`, 640×640 LCD). That is the only cooler available to the developer. Other Kraken models are not claimed to work.
+`./install.sh` installs the program to `/usr/local/bin/kraken-gif-and-overlay`. 
 
-The pieces that would need checking for another model live in [`src/protocol.rs`](src/protocol.rs):
-
-- `NZXT_VID` and `ELITE_PID`, the USB identity
-- `WIDTH` and `HEIGHT`, the panel size used by the Q565 encoder and the overlay
-- `BULK_MAGIC` and mode `0x08` in `bulk_header`, plus the HID reports `FRAME_SETUP` (`0x36`) and `FRAME_COMMIT`
-- `LIQUID_SCREEN` (`0x38`), which switches the panel back to the built-in liquid temperature
-- `LCD_QUERY` / `LCD_INFO_PREFIX` and the brightness and orientation bytes, used by `--get-rotation` and `--set-rotation`
-
-`claim_bulk_out` in `src/main.rs` takes the first bulk OUT endpoint. A model that uses a different endpoint, or a different image encoding than Q565, would need a change there too.
+Show a GIF without writing a config:
+```bash
+/usr/local/bin/kraken-gif-and-overlay --gif <path>
+```
 
 ## Switches
 
@@ -46,18 +41,9 @@ The pieces that would need checking for another model live in [`src/protocol.rs`
 --help                 Show this help
 ```
 
-With no switches and no config file, the program prints this list and exits. Config is written only when `--save-config` is passed.
+With no switches and no config file, the program prints this list and exits. Config is written only when `--save-config` is passed. Subsequent executions once config has been saved starts the animation on the device.
 
-`--get-rotation` and `--set-rotation` talk to the cooler and then exit. Pass either one by itself. Stop the service first, or the cooler is already open. The liquid screen follows that angle on its own. Streamed frames are rotated to match it when the service starts.
-
-## Quick start
-
-`./install.sh` installs the program to `/usr/local/bin/kraken-gif-and-overlay`. 
-
-Show a GIF without writing a config:
-```bash
-/usr/local/bin/kraken-gif-and-overlay --gif <path>
-```
+`--get-rotation` and `--set-rotation` talk to the cooler and then exit. Pass either one by itself. The default liquid temperature screen follows that angle on its own. Streamed frames are rotated to match it when the service starts.
 
 ## Setup
 
@@ -109,16 +95,6 @@ images:
     position: 50
 ```
 
-## Tests
-
-The tests do not open the cooler. They cover the slideshow, the config file, argument parsing, sensor selection, frame cropping, and the USB report layout.
-
-```bash
-cargo test
-```
-
-Building still needs libusb and hidapi, because the program links those libraries.
-
 ## Build
 
 Requires Rust, libusb, and hidapi.
@@ -132,6 +108,16 @@ Requires Rust, libusb, and hidapi.
 ```bash
 cargo run --release -- --gif <path>
 ```
+
+## Tests
+
+The tests do not open the cooler. They cover the slideshow, the config file, argument parsing, sensor selection, frame cropping, and the USB report layout.
+
+```bash
+cargo test
+```
+
+Building still needs libusb and hidapi, because the program links those libraries.
 
 ## Install as a system service
 
@@ -166,6 +152,20 @@ If the cooler is already open, the journal shows that the Kraken is in use. Cool
 sudo systemctl reset-failed kraken-gif-and-overlay
 sudo systemctl start kraken-gif-and-overlay
 ```
+
+## Compatibility
+
+This was written for, and tested only on, the **NZXT Kraken 2023 Elite** (USB `1e71:300c`, 640×640 LCD). That is the only cooler available to the developer. Other Kraken models are not claimed to work.
+
+The pieces that would need checking for another model live in [`src/protocol.rs`](src/protocol.rs):
+
+- `NZXT_VID` and `ELITE_PID`, the USB identity
+- `WIDTH` and `HEIGHT`, the panel size used by the Q565 encoder and the overlay
+- `BULK_MAGIC` and mode `0x08` in `bulk_header`, plus the HID reports `FRAME_SETUP` (`0x36`) and `FRAME_COMMIT`
+- `LIQUID_SCREEN` (`0x38`), which switches the panel back to the built-in liquid temperature
+- `LCD_QUERY` / `LCD_INFO_PREFIX` and the brightness and orientation bytes, used by `--get-rotation` and `--set-rotation`
+
+`claim_bulk_out` in `src/main.rs` takes the first bulk OUT endpoint. A model that uses a different endpoint, or a different image encoding than Q565, would need a change there too.
 
 ## Known issues
 
