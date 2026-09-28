@@ -21,14 +21,13 @@ use q565::encode::Q565EncodeContext;
 use q565::utils::{encode_rgb565_unchecked, rgb888_to_rgb565};
 use rusb::{DeviceHandle, Direction, TransferType, UsbContext};
 
-const NZXT_VID: u16 = 0x1E71;
-const ELITE_PID: u16 = 0x300C;
-const WIDTH: u32 = 640;
-const HEIGHT: u32 = 640;
-const LIQUID_SCREEN: [u8; 4] = [0x38, 0x01, 0x02, 0x00];
-const BULK_MAGIC: [u8; 12] = [
-    0x12, 0xFA, 0x01, 0xE8, 0xAB, 0xCD, 0xEF, 0x98, 0x76, 0x54, 0x32, 0x10,
-];
+mod protocol;
+
+use protocol::{
+    bulk_header, orientation_degrees, orientation_report, ELITE_PID, FRAME_COMMIT, FRAME_COMMIT_ACK,
+    FRAME_SETUP, FRAME_SETUP_ACK, HEIGHT, LCD_BRIGHTNESS_OFFSET, LCD_INFO_PREFIX, LCD_ORIENTATION_OFFSET,
+    LCD_QUERY, LIQUID_SCREEN, NZXT_VID, WIDTH,
+};
 
 fn main() -> Result<()> {
     let args = parse_args()?;
@@ -103,7 +102,7 @@ fn main() -> Result<()> {
 
     let _restore = LiquidRestore { hid: &hid };
     let (_, orientation) = lcd_info(&hid)?;
-    let rotation = u16::from(orientation) * 90;
+    let rotation = orientation_degrees(orientation)?;
     println!("Frame rotation {rotation}°");
     let mut sensors = SensorCache {
         cpu: settings.cpu,
@@ -202,20 +201,17 @@ fn send_q565(
     payload: &[u8],
 ) -> Result<()> {
     drain_hid(hid);
-    hid_write(hid, &[0x36, 0x01, 0x00, 0x01, 0x08])?;
-    let _ = wait_hid_prefix(hid, [0x37, 0x01], 40);
+    hid_write(hid, &FRAME_SETUP)?;
+    let _ = read_hid_prefix(hid, FRAME_SETUP_ACK, 40);
 
-    let mut header = [0u8; 20];
-    header[..12].copy_from_slice(&BULK_MAGIC);
-    header[12] = 0x08;
-    header[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    let header = bulk_header(payload.len());
     bulk.write_bulk(endpoint, &header, Duration::from_secs(1))
         .context("bulk header")?;
     bulk.write_bulk(endpoint, payload, Duration::from_secs(1))
         .context("bulk frame")?;
 
-    hid_write(hid, &[0x36, 0x02])?;
-    let _ = wait_hid_prefix(hid, [0x37, 0x02], 40);
+    hid_write(hid, &FRAME_COMMIT)?;
+    let _ = read_hid_prefix(hid, FRAME_COMMIT_ACK, 40);
     Ok(())
 }
 
@@ -290,20 +286,6 @@ fn drain_hid(device: &HidDevice) {
     while device.read_timeout(&mut buffer, 0).unwrap_or(0) > 0 {}
 }
 
-fn wait_hid_prefix(device: &HidDevice, prefix: [u8; 2], timeout_ms: u64) -> bool {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut buffer = [0u8; 64];
-    while Instant::now() < deadline {
-        let left = deadline.saturating_duration_since(Instant::now()).as_millis() as i32;
-        match device.read_timeout(&mut buffer, left.max(1)) {
-            Ok(n) if n >= 2 && buffer[0] == prefix[0] && buffer[1] == prefix[1] => return true,
-            Ok(_) => continue,
-            Err(_) => return false,
-        }
-    }
-    false
-}
-
 fn wait_until(running: &AtomicBool, deadline: Instant) {
     while running.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -334,29 +316,24 @@ fn open_hid(purpose: &str) -> Result<OpenHid> {
 
 fn lcd_info(device: &HidDevice) -> Result<(u8, u8)> {
     drain_hid(device);
-    hid_write(device, &[0x30, 0x01])?;
-    let msg = read_hid_prefix(device, [0x31, 0x01], 500)?;
-    let orientation = msg[0x1A];
-    if orientation > 3 {
-        bail!("Unexpected LCD orientation {orientation}");
-    }
-    Ok((msg[0x18], orientation))
+    hid_write(device, &LCD_QUERY)?;
+    let msg = read_hid_prefix(device, LCD_INFO_PREFIX, 500)?;
+    let orientation = msg[LCD_ORIENTATION_OFFSET];
+    orientation_degrees(orientation)?;
+    Ok((msg[LCD_BRIGHTNESS_OFFSET], orientation))
 }
 
 fn show_rotation() -> Result<()> {
     let hid = open_hid("Stop kraken-gif-and-overlay before --get-rotation")?;
     let (_, orientation) = lcd_info(&hid.device)?;
-    println!("rotation = {}", u16::from(orientation) * 90);
+    println!("rotation = {}", orientation_degrees(orientation)?);
     Ok(())
 }
 
 fn set_rotation(degrees: u16) -> Result<()> {
     let hid = open_hid("Stop kraken-gif-and-overlay before --set-rotation")?;
     let (brightness, _) = lcd_info(&hid.device)?;
-    hid_write(
-        &hid.device,
-        &[0x30, 0x02, 0x01, brightness, 0x00, 0x00, 0x01, (degrees / 90) as u8],
-    )?;
+    hid_write(&hid.device, &orientation_report(brightness, degrees))?;
     println!("rotation = {degrees}");
     Ok(())
 }
@@ -402,8 +379,12 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut args = Args::default();
-    let mut rest = std::env::args().skip(1);
+    let mut rest = input.into_iter();
     while let Some(arg) = rest.next() {
         args.any = true;
         match arg.as_str() {
@@ -472,6 +453,7 @@ fn parse_args() -> Result<Args> {
     Ok(args)
 }
 
+#[derive(Debug)]
 enum RotationCmd {
     Show,
     Set(u16),
@@ -577,7 +559,7 @@ fn load_gif(path: &Path, position: u8) -> Result<Vec<(RgbImage, Duration)>> {
     let mut loaded = Vec::with_capacity(frames.len());
     for frame in frames {
         let (numer, denom) = frame.delay().numer_denom_ms();
-        let millis = if denom == 0 { 100 } else { numer / denom.max(1) };
+        let delay = frame_delay(numer, denom);
         let rgb = image::DynamicImage::ImageRgba8(frame.into_buffer()).to_rgb8();
         let (width, height) = rgb.dimensions();
         if width == 0 || height == 0 {
@@ -585,9 +567,14 @@ fn load_gif(path: &Path, position: u8) -> Result<Vec<(RgbImage, Duration)>> {
         }
         let square = crop_square(&rgb, position);
         let scaled = image::imageops::resize(&square, WIDTH, HEIGHT, FilterType::Lanczos3);
-        loaded.push((scaled, Duration::from_millis(millis.max(1) as u64)));
+        loaded.push((scaled, delay));
     }
     Ok(loaded)
+}
+
+fn frame_delay(numer: u32, denom: u32) -> Duration {
+    let millis = if denom == 0 { 100 } else { numer / denom.max(1) };
+    Duration::from_millis(u64::from(millis.max(1)))
 }
 
 /// Square window on the shorter side. `position` slides it along the longer side.
@@ -788,6 +775,7 @@ struct RunnableImage {
     opacity: u8,
 }
 
+#[derive(Clone)]
 struct Slide {
     frames: Vec<(RgbImage, Duration)>,
     boxes: bool,
@@ -1789,6 +1777,13 @@ mod crop {
         assert!(parse_position("101").is_err());
         assert!(parse_position("left").is_err());
     }
+
+    #[test]
+    fn a_missing_gif_delay_is_a_tenth_of_a_second() {
+        assert_eq!(frame_delay(0, 0), Duration::from_millis(100));
+        assert_eq!(frame_delay(50, 1), Duration::from_millis(50));
+        assert_eq!(frame_delay(0, 1), Duration::from_millis(1));
+    }
 }
 
 #[cfg(test)]
@@ -1833,6 +1828,11 @@ mod slideshow {
         assert_eq!(next_slide(PlayOrder::Sequential, 0, 3, &mut rng), 1);
         assert_eq!(next_slide(PlayOrder::Sequential, 2, 3, &mut rng), 0);
         assert_eq!(next_slide(PlayOrder::Random, 0, 2, &mut rng), 1);
+        for _ in 0..40 {
+            let next = next_slide(PlayOrder::Random, 1, 4, &mut rng);
+            assert_ne!(next, 1);
+            assert!(next < 4);
+        }
         let mut opened_elsewhere = false;
         for seed in 1..30 {
             let start = starting_slide(PlayOrder::Random, 4, &mut Rng(seed));
@@ -1841,11 +1841,27 @@ mod slideshow {
         }
         assert!(opened_elsewhere);
         assert_eq!(starting_slide(PlayOrder::Sequential, 4, &mut Rng(1)), 0);
-        for _ in 0..40 {
-            let next = next_slide(PlayOrder::Random, 1, 4, &mut rng);
-            assert_ne!(next, 1);
-            assert!(next < 4);
-        }
+    }
+
+    #[test]
+    fn the_hold_advances_a_sequential_slideshow() {
+        let pixel = RgbImage::from_pixel(1, 1, Rgb([0, 0, 0]));
+        let slide = Slide {
+            frames: vec![(pixel, Duration::from_millis(10))],
+            boxes: false,
+            opacity: 0,
+        };
+        let mut player = Player::new(
+            vec![slide.clone(), slide],
+            Duration::from_millis(30),
+            Duration::ZERO,
+            PlayOrder::Sequential,
+        );
+        let start = player.phase_start;
+        assert_eq!(player.index, 0);
+        assert!(!player.poll(start + Duration::from_millis(29)));
+        assert!(player.poll(start + Duration::from_millis(30)));
+        assert_eq!(player.index, 1);
     }
 
     #[test]
@@ -1954,5 +1970,86 @@ mod rotation {
         both.set_rotation = Some(180);
         assert!(rotation_request(&both).is_err());
         assert!(rotation_request(&Args::default()).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod suite {
+    use super::*;
+
+    fn words(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    fn sensor(id: &str, chip: &str, label: &str, path: &str, fan: bool) -> Sensor {
+        Sensor {
+            id: id.to_string(),
+            chip: chip.to_string(),
+            label: label.to_string(),
+            path: PathBuf::from(path),
+            has_fan: fan,
+            celsius: 40.0,
+        }
+    }
+
+    #[test]
+    fn switches_parse_and_rotation_stays_alone() {
+        let args = parse_args_from(words(&["--gif", "demo.gif", "--debug"])).unwrap();
+        assert!(args.debug);
+        assert_eq!(args.gif.unwrap(), PathBuf::from("demo.gif"));
+
+        let query = parse_args_from(words(&["--get-rotation"])).unwrap();
+        assert!(matches!(rotation_request(&query).unwrap(), Some(RotationCmd::Show)));
+
+        let mixed = parse_args_from(words(&["--get-rotation", "--debug"])).unwrap();
+        assert!(rotation_request(&mixed).unwrap_err().to_string().contains("on its own"));
+        assert!(parse_args_from(words(&["--set-rotation"])).is_err());
+        assert!(parse_args_from(words(&["--nope"])).is_err());
+    }
+
+    #[test]
+    fn deleting_an_image_matches_the_file_name() {
+        let mut config = Config::default();
+        config.images.push(ImageConfig {
+            gif_path: "one.gif".to_string(),
+            boxes: false,
+            box_opacity: 150,
+            position: 50,
+        });
+        config.images.push(ImageConfig {
+            gif_path: "two.gif".to_string(),
+            boxes: false,
+            box_opacity: 150,
+            position: 50,
+        });
+        assert!(delete_image(&mut config, None).is_err());
+        delete_image(&mut config, Some(Path::new("/tmp/two.gif"))).unwrap();
+        assert_eq!(config.images.len(), 1);
+        assert_eq!(config.images[0].gif_path, "one.gif");
+        delete_image(&mut config, None).unwrap();
+        assert!(config.images.is_empty());
+    }
+
+    #[test]
+    fn cpu_and_gpu_selection_prefers_the_labelled_chip() {
+        let sensors = vec![
+            sensor("k10temp:Tdie", "k10temp", "Tdie", "/sys/tdie", false),
+            sensor("k10temp:Tctl", "k10temp", "Tctl", "/sys/tctl", false),
+            sensor("amdgpu:junction", "amdgpu", "junction", "/sys/temp2_input", true),
+            sensor("amdgpu:edge", "amdgpu", "edge", "/sys/temp1_input", true),
+            sensor("nvme:Composite", "nvme", "Composite", "/sys/nvme", false),
+        ];
+        assert_eq!(pick_cpu(&sensors).unwrap().label, "Tctl");
+        assert_eq!(pick_gpu(&sensors).unwrap().label, "edge");
+        assert_eq!(resolve_sensor(&sensors, "k10temp:Tctl").unwrap().label, "Tctl");
+        assert!(resolve_sensor(&sensors, "missing").is_err());
+    }
+
+    #[test]
+    fn device_addresses_are_recognised() {
+        assert!(is_pci_address("0000:03:00.0"));
+        assert!(!is_pci_address("hwmon0"));
+        assert!(is_i2c_address("0000-0018"));
+        assert!(!is_i2c_address("card0"));
     }
 }

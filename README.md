@@ -6,6 +6,20 @@ This was written because liquidctl (which lists this cooler as `NZXT Kraken 2023
 
 Ctrl+C switches the panel back to the liquid-temperature screen. If another program already has the cooler open, the streamer exits.
 
+## Compatibility
+
+This was written for, and tested only on, the **NZXT Kraken 2023 Elite** (USB `1e71:300c`, 640×640 LCD). That is the only cooler available to the developer. Other Kraken models are not claimed to work.
+
+The pieces that would need checking for another model live in [`src/protocol.rs`](src/protocol.rs):
+
+- `NZXT_VID` and `ELITE_PID`, the USB identity
+- `WIDTH` and `HEIGHT`, the panel size used by the Q565 encoder and the overlay
+- `BULK_MAGIC` and mode `0x08` in `bulk_header`, plus the HID reports `FRAME_SETUP` (`0x36`) and `FRAME_COMMIT`
+- `LIQUID_SCREEN` (`0x38`), which switches the panel back to the built-in liquid temperature
+- `LCD_QUERY` / `LCD_INFO_PREFIX` and the brightness and orientation bytes, used by `--get-rotation` and `--set-rotation`
+
+`claim_bulk_out` in `src/main.rs` takes the first bulk OUT endpoint. A model that uses a different endpoint, or a different image encoding than Q565, would need a change there too.
+
 ## Switches
 
 ```
@@ -94,6 +108,16 @@ images:
     boxOpacity: 150
     position: 50
 ```
+
+## Tests
+
+The tests do not open the cooler. They cover the slideshow, the config file, argument parsing, sensor selection, frame cropping, and the USB report layout.
+
+```bash
+cargo test
+```
+
+Building still needs libusb and hidapi, because the program links those libraries.
 
 ## Build
 
