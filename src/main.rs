@@ -32,6 +32,11 @@ const BULK_MAGIC: [u8; 12] = [
 
 fn main() -> Result<()> {
     let args = parse_args()?;
+    match rotation_request(&args)? {
+        Some(RotationCmd::Show) => return show_rotation(),
+        Some(RotationCmd::Set(degrees)) => return set_rotation(degrees),
+        None => {}
+    }
     if args.help || (!args.any && !config_exists()?) {
         print_usage();
         if args.help {
@@ -97,6 +102,9 @@ fn main() -> Result<()> {
         .context("HID interface")?;
 
     let _restore = LiquidRestore { hid: &hid };
+    let (_, orientation) = lcd_info(&hid)?;
+    let rotation = u16::from(orientation) * 90;
+    println!("Frame rotation {rotation}°");
     let mut sensors = SensorCache {
         cpu: settings.cpu,
         gpu: settings.gpu,
@@ -134,6 +142,7 @@ fn main() -> Result<()> {
             },
             fade,
         );
+        let composed = rotate_frame(composed, rotation);
         let payload = encode_q565(&composed)?;
         send_q565(&hid, &bulk, endpoint, &payload)?;
 
@@ -208,6 +217,15 @@ fn send_q565(
     hid_write(hid, &[0x36, 0x02])?;
     let _ = wait_hid_prefix(hid, [0x37, 0x02], 40);
     Ok(())
+}
+
+fn rotate_frame(image: RgbImage, degrees: u16) -> RgbImage {
+    match degrees {
+        90 => image::imageops::rotate90(&image),
+        180 => image::imageops::rotate180(&image),
+        270 => image::imageops::rotate270(&image),
+        _ => image,
+    }
 }
 
 fn encode_q565(image: &RgbImage) -> Result<Vec<u8>> {
@@ -297,22 +315,75 @@ fn wait_until(running: &AtomicBool, deadline: Instant) {
 }
 
 fn reset_liquid() -> Result<()> {
-    let hid_api = hidapi::HidApi::new()?;
-    let hid = hid_api
-        .open(NZXT_VID, ELITE_PID)
-        .map_err(hid_busy)
-        .context("Stop kraken-gif-and-overlay before --reset")?;
-    hid_write(&hid, &LIQUID_SCREEN)?;
+    let hid = open_hid("Stop kraken-gif-and-overlay before --reset")?;
+    hid_write(&hid.device, &LIQUID_SCREEN)?;
     println!("Restored the liquid temperature screen");
     Ok(())
 }
 
+struct OpenHid {
+    _api: hidapi::HidApi,
+    device: HidDevice,
+}
+
+fn open_hid(purpose: &str) -> Result<OpenHid> {
+    let api = hidapi::HidApi::new()?;
+    let device = api.open(NZXT_VID, ELITE_PID).map_err(hid_busy).context(purpose.to_string())?;
+    Ok(OpenHid { _api: api, device })
+}
+
+fn lcd_info(device: &HidDevice) -> Result<(u8, u8)> {
+    drain_hid(device);
+    hid_write(device, &[0x30, 0x01])?;
+    let msg = read_hid_prefix(device, [0x31, 0x01], 500)?;
+    let orientation = msg[0x1A];
+    if orientation > 3 {
+        bail!("Unexpected LCD orientation {orientation}");
+    }
+    Ok((msg[0x18], orientation))
+}
+
+fn show_rotation() -> Result<()> {
+    let hid = open_hid("Stop kraken-gif-and-overlay before --get-rotation")?;
+    let (_, orientation) = lcd_info(&hid.device)?;
+    println!("rotation = {}", u16::from(orientation) * 90);
+    Ok(())
+}
+
+fn set_rotation(degrees: u16) -> Result<()> {
+    let hid = open_hid("Stop kraken-gif-and-overlay before --set-rotation")?;
+    let (brightness, _) = lcd_info(&hid.device)?;
+    hid_write(
+        &hid.device,
+        &[0x30, 0x02, 0x01, brightness, 0x00, 0x00, 0x01, (degrees / 90) as u8],
+    )?;
+    println!("rotation = {degrees}");
+    Ok(())
+}
+
+fn read_hid_prefix(device: &HidDevice, prefix: [u8; 2], timeout_ms: u64) -> Result<[u8; 64]> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut buffer = [0u8; 64];
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now()).as_millis() as i32;
+        match device.read_timeout(&mut buffer, left.max(1)) {
+            Ok(n) if n >= 2 && buffer[0] == prefix[0] && buffer[1] == prefix[1] => return Ok(buffer),
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    bail!("The Kraken did not answer.")
+}
+
+#[derive(Default)]
 struct Args {
     any: bool,
     help: bool,
     debug: bool,
     list_sensors: bool,
     reset: bool,
+    get_rotation: bool,
+    set_rotation: Option<u16>,
     save_config: bool,
     add: bool,
     delete: bool,
@@ -331,28 +402,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = Args {
-        any: false,
-        help: false,
-        debug: false,
-        list_sensors: false,
-        reset: false,
-        save_config: false,
-        add: false,
-        delete: false,
-        update: false,
-        gif: None,
-        position: None,
-        duration: None,
-        fade: None,
-        order: None,
-        cpu_sensor: None,
-        gpu_sensor: None,
-        boxes: None,
-        opacity: None,
-        color: None,
-        font: None,
-    };
+    let mut args = Args::default();
     let mut rest = std::env::args().skip(1);
     while let Some(arg) = rest.next() {
         args.any = true;
@@ -361,6 +411,13 @@ fn parse_args() -> Result<Args> {
             "--debug" => args.debug = true,
             "--list-sensors" => args.list_sensors = true,
             "--reset" => args.reset = true,
+            "--get-rotation" => args.get_rotation = true,
+            "--set-rotation" => {
+                args.set_rotation = Some(parse_rotation(&next_arg(
+                    &mut rest,
+                    "--set-rotation needs 0, 90, 180, or 270",
+                )?)?)
+            }
             "--save-config" => args.save_config = true,
             "--add" => args.add = true,
             "--delete" => args.delete = true,
@@ -415,6 +472,57 @@ fn parse_args() -> Result<Args> {
     Ok(args)
 }
 
+enum RotationCmd {
+    Show,
+    Set(u16),
+}
+
+fn rotation_request(args: &Args) -> Result<Option<RotationCmd>> {
+    if !args.get_rotation && args.set_rotation.is_none() {
+        return Ok(None);
+    }
+    if args.get_rotation && args.set_rotation.is_some() {
+        bail!("--get-rotation and --set-rotation must be used on their own.");
+    }
+    let other = args.help
+        || args.debug
+        || args.list_sensors
+        || args.reset
+        || args.save_config
+        || args.add
+        || args.delete
+        || args.update
+        || args.gif.is_some()
+        || args.position.is_some()
+        || args.duration.is_some()
+        || args.fade.is_some()
+        || args.order.is_some()
+        || args.cpu_sensor.is_some()
+        || args.gpu_sensor.is_some()
+        || args.boxes.is_some()
+        || args.opacity.is_some()
+        || args.color.is_some()
+        || args.font.is_some();
+    if other {
+        let name = if args.get_rotation { "--get-rotation" } else { "--set-rotation" };
+        bail!("{name} must be used on its own.");
+    }
+    match args.set_rotation {
+        Some(degrees) => Ok(Some(RotationCmd::Set(degrees))),
+        None => Ok(Some(RotationCmd::Show)),
+    }
+}
+
+fn parse_rotation(value: &str) -> Result<u16> {
+    match value.trim() {
+        "0" => Ok(0),
+        "90" => Ok(90),
+        "180" => Ok(180),
+        "270" => Ok(270),
+        _ => bail!("rotation must be 0, 90, 180, or 270"),
+    }
+}
+
 fn next_arg(args: &mut impl Iterator<Item = String>, message: &str) -> Result<String> {
     match args.next() {
         Some(value) if !value.is_empty() && !value.starts_with('-') => Ok(value),
@@ -445,6 +553,8 @@ Usage: {program} [options]
   --font <path>          .ttf font file
   --list-sensors         Print temperature sensors and exit
   --reset                Restore the liquid temperature screen and exit
+  --get-rotation         Print the LCD rotation and exit. Use on its own
+  --set-rotation <deg>   Set the LCD rotation to 0, 90, 180, or 270, then exit. Use on its own
   --debug                Print frame stats about every two seconds
   --help                 Show this help
 "
@@ -706,16 +816,18 @@ struct Player {
 impl Player {
     fn new(slides: Vec<Slide>, hold: Duration, fade: Duration, order: PlayOrder) -> Self {
         let fade_in = slides.len() > 1 && !fade.is_zero();
+        let mut rng = Rng::from_time();
+        let index = starting_slide(order, slides.len(), &mut rng);
         Self {
             slides,
-            index: 0,
+            index,
             frame: 0,
             phase: if fade_in { Phase::In } else { Phase::Hold },
             phase_start: Instant::now(),
             hold,
             fade,
             order,
-            rng: Rng::from_time(),
+            rng,
         }
     }
 
@@ -777,6 +889,13 @@ fn phase_opacity(phase: Phase, elapsed: Duration, fade: Duration) -> f32 {
         Phase::Hold => 1.0,
         Phase::Out => (1.0 - ratio).clamp(0.0, 1.0),
     }
+}
+
+fn starting_slide(order: PlayOrder, len: usize, rng: &mut Rng) -> usize {
+    if len <= 1 || order == PlayOrder::Sequential {
+        return 0;
+    }
+    (rng.next_u64() as usize) % len
 }
 
 fn next_slide(order: PlayOrder, current: usize, len: usize, rng: &mut Rng) -> usize {
@@ -1714,6 +1833,14 @@ mod slideshow {
         assert_eq!(next_slide(PlayOrder::Sequential, 0, 3, &mut rng), 1);
         assert_eq!(next_slide(PlayOrder::Sequential, 2, 3, &mut rng), 0);
         assert_eq!(next_slide(PlayOrder::Random, 0, 2, &mut rng), 1);
+        let mut opened_elsewhere = false;
+        for seed in 1..30 {
+            let start = starting_slide(PlayOrder::Random, 4, &mut Rng(seed));
+            assert!(start < 4);
+            opened_elsewhere |= start != 0;
+        }
+        assert!(opened_elsewhere);
+        assert_eq!(starting_slide(PlayOrder::Sequential, 4, &mut Rng(1)), 0);
         for _ in 0..40 {
             let next = next_slide(PlayOrder::Random, 1, 4, &mut rng);
             assert_ne!(next, 1);
@@ -1781,5 +1908,51 @@ mod slideshow {
         let text = serde_yaml::to_string(&config.slideshow).unwrap();
         assert!(text.contains("duration: 120"), "{text}");
         assert!(text.contains("fade: 0.3\n") || text.contains("fade: 0.3\r\n"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod rotation {
+    use super::*;
+
+    #[test]
+    fn frames_rotate_clockwise_with_the_panel() {
+        let mut image = RgbImage::from_pixel(2, 2, Rgb([0, 0, 0]));
+        image.put_pixel(0, 0, Rgb([1, 0, 0]));
+        assert_eq!(*rotate_frame(image.clone(), 0).get_pixel(0, 0), Rgb([1, 0, 0]));
+        assert_eq!(*rotate_frame(image.clone(), 90).get_pixel(1, 0), Rgb([1, 0, 0]));
+        assert_eq!(*rotate_frame(image.clone(), 180).get_pixel(1, 1), Rgb([1, 0, 0]));
+        assert_eq!(*rotate_frame(image, 270).get_pixel(0, 1), Rgb([1, 0, 0]));
+    }
+
+    #[test]
+    fn rotation_accepts_quarter_turns() {
+        assert_eq!(parse_rotation("0").unwrap(), 0);
+        assert_eq!(parse_rotation("90").unwrap(), 90);
+        assert_eq!(parse_rotation("180").unwrap(), 180);
+        assert_eq!(parse_rotation("270").unwrap(), 270);
+        assert!(parse_rotation("45").is_err());
+    }
+
+    #[test]
+    fn rotation_commands_reject_other_switches() {
+        let mut query = Args::default();
+        query.get_rotation = true;
+        assert!(matches!(rotation_request(&query).unwrap(), Some(RotationCmd::Show)));
+
+        let mut set = Args::default();
+        set.set_rotation = Some(90);
+        assert!(matches!(rotation_request(&set).unwrap(), Some(RotationCmd::Set(90))));
+
+        query.debug = true;
+        assert!(rotation_request(&query).is_err());
+        set.gif = Some(PathBuf::from("a.gif"));
+        assert!(rotation_request(&set).is_err());
+
+        let mut both = Args::default();
+        both.get_rotation = true;
+        both.set_rotation = Some(180);
+        assert!(rotation_request(&both).is_err());
+        assert!(rotation_request(&Args::default()).unwrap().is_none());
     }
 }

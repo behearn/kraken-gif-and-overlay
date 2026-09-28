@@ -22,6 +22,8 @@ Ctrl+C switches the panel back to the liquid-temperature screen. If another prog
 --gpu-sensor <id>      GPU temperature sensor. Default: auto
 --list-sensors         Print temperature sensors and exit
 --reset                Restore the liquid temperature screen and exit
+--get-rotation         Print the LCD rotation and exit. Use on its own
+--set-rotation <deg>   Set the LCD rotation to 0, 90, 180, or 270, then exit. Use on its own
 --box <yes|no>         Draw boxes behind the text on this image. Default: no
 --opacity <0-255>      Box opacity for this image. Default: 150
 --color <RRGGBB>       Text colour. Default: f2f2f2
@@ -31,6 +33,8 @@ Ctrl+C switches the panel back to the liquid-temperature screen. If another prog
 ```
 
 With no switches and no config file, the program prints this list and exits. Config is written only when `--save-config` is passed.
+
+`--get-rotation` and `--set-rotation` talk to the cooler and then exit. Pass either one by itself. Stop the service first, or the cooler is already open. The liquid screen follows that angle on its own. Streamed frames are rotated to match it when the service starts.
 
 ## Quick start
 
