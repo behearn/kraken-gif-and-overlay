@@ -37,7 +37,7 @@ Show a GIF without writing a config:
 --opacity <0-255>      Box opacity for this image. Default: 150
 --color <RRGGBB>       Text colour. Default: f2f2f2
 --font <path>          .ttf font file
---debug                Print frame stats about every two seconds
+--debug                Print each GIF as it loads, and frame stats about every two seconds
 --help                 Show this help
 ```
 
@@ -65,7 +65,7 @@ CPU and GPU temperatures are detected automatically. The CPU sensor is `Tctl`, `
 /usr/local/bin/kraken-gif-and-overlay --duration 15 --fade 1 --order random --save-config
 ```
 
-When more than one image is configured, they rotate. `--duration` is how many seconds each image stays up. `--fade` is how long the GIF takes to fade in from black and out to black. The temperatures stay at full strength. `--order sequential` follows the list. `--order random` picks any image except the one on screen. A single image loops, and duration and fade are ignored.
+When more than one image is configured, they rotate. `--duration` is how many seconds each image stays up. `--fade` is how long the GIF takes to fade in from black and out to black. The temperatures stay at full strength. `--order sequential` follows the list. `--order random` picks any image except the one on screen. A single image loops, and duration and fade are ignored. Only the image on screen and the next one are decoded. The next GIF is prepared during the hold, so memory follows the size of those two files.
 
 A GIF that is not square is cropped to its shorter side, then scaled, so a circle stays a circle. `--position` slides that square along the longer side: `0` keeps the left or top, `100` keeps the right or bottom, and `50` (the default) centers it. Position, box, and box opacity are stored on each image.
 

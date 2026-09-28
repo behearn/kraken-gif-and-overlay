@@ -64,23 +64,16 @@ fn main() -> Result<()> {
     let Some(settings) = load_settings(&args)? else {
         return Ok(());
     };
-    let mut slides = Vec::with_capacity(settings.images.len());
-    for image in &settings.images {
-        println!("Loading {}", image.path.display());
-        slides.push(Slide {
-            frames: load_gif(&image.path, image.position)?,
-            boxes: image.boxes,
-            opacity: image.opacity,
-        });
-    }
+    let mut player = Player::new(settings.images.len(), settings.hold, settings.fade, settings.order);
+    let mut library = Library::open(settings.images, player.index, args.debug)?;
     let font = load_font(&settings.font)?;
-    let frame_count: usize = slides.iter().map(|slide| slide.frames.len()).sum();
-    if slides.len() == 1 {
+    let frame_count = library.current.frames.len();
+    if library.images.len() == 1 {
         println!("Kraken 2023 Elite: {WIDTH}x{HEIGHT}, {frame_count} GIF frames, Q565 stream");
     } else {
         println!(
-            "Kraken 2023 Elite: {WIDTH}x{HEIGHT}, {} images, {frame_count} GIF frames, Q565 stream",
-            slides.len()
+            "Kraken 2023 Elite: {WIDTH}x{HEIGHT}, {} images, Q565 stream",
+            library.images.len()
         );
         println!(
             "Slideshow: {}s on each image, fade {}s, {}",
@@ -104,6 +97,9 @@ fn main() -> Result<()> {
     let (_, orientation) = lcd_info(&hid)?;
     let rotation = orientation_degrees(orientation)?;
     println!("Frame rotation {rotation}°");
+    if let Some(next) = player.planned_next() {
+        library.prefetch(next);
+    }
     let mut sensors = SensorCache {
         cpu: settings.cpu,
         gpu: settings.gpu,
@@ -111,22 +107,25 @@ fn main() -> Result<()> {
         gpu_c: None,
         read_at: None,
     };
-    let mut player = Player::new(slides, settings.hold, settings.fade, settings.order);
     let mut sent = 0u32;
     let mut window = Instant::now();
     let mut deadline = Instant::now();
 
     while running.load(Ordering::Relaxed) {
+        library.note_pending();
         let now = Instant::now();
         if player.poll(now) {
+            library.activate(player.index)?;
+            if let Some(next) = player.planned_next() {
+                library.prefetch(next);
+            }
             deadline = now;
         }
-        let (frame_index, boxes, opacity) = {
-            let slide = &player.slides[player.index];
-            (player.frame, slide.boxes, slide.opacity)
-        };
+        let frame_index = player.frame;
         let fade = player.opacity(now);
-        let frame = &player.slides[player.index].frames[frame_index];
+        let frame = &library.current.frames[frame_index];
+        let boxes = library.current.boxes;
+        let opacity = library.current.opacity;
         let delay = frame.1;
         let (cpu, gpu) = sensors.get();
         let composed = draw_overlay(
@@ -150,8 +149,8 @@ fn main() -> Result<()> {
             let now = Instant::now();
             if now.duration_since(window) >= Duration::from_secs(2) {
                 let secs = now.duration_since(window).as_secs_f32();
-                let image = if player.slides.len() > 1 {
-                    format!("  image {}/{}", player.index + 1, player.slides.len())
+                let image = if player.count > 1 {
+                    format!("  image {}/{}", player.index + 1, player.count)
                 } else {
                     String::new()
                 };
@@ -168,7 +167,7 @@ fn main() -> Result<()> {
         }
 
         deadline += delay;
-        let frame_count = player.slides[player.index].frames.len();
+        let frame_count = library.current.frames.len();
         player.frame = (player.frame + 1) % frame_count;
         let now = Instant::now();
         if deadline > now {
@@ -537,7 +536,7 @@ Usage: {program} [options]
   --reset                Restore the liquid temperature screen and exit
   --get-rotation         Print the LCD rotation and exit. Use on its own
   --set-rotation <deg>   Set the LCD rotation to 0, 90, 180, or 270, then exit. Use on its own
-  --debug                Print frame stats about every two seconds
+  --debug                Print each GIF as it loads, and frame stats about every two seconds
   --help                 Show this help
 "
     );
@@ -768,6 +767,7 @@ struct Settings {
     order: PlayOrder,
 }
 
+#[derive(Clone)]
 struct RunnableImage {
     path: PathBuf,
     position: u8,
@@ -775,11 +775,172 @@ struct RunnableImage {
     opacity: u8,
 }
 
-#[derive(Clone)]
 struct Slide {
     frames: Vec<(RgbImage, Duration)>,
     boxes: bool,
     opacity: u8,
+}
+
+struct LoadReport {
+    frames: usize,
+    decoded: u64,
+}
+
+struct Pending {
+    index: usize,
+    handle: std::thread::JoinHandle<Result<Slide>>,
+    report: Option<std::sync::mpsc::Receiver<LoadReport>>,
+    reported: bool,
+}
+
+/// The image on screen, plus the next one decoding on a side thread.
+struct Library {
+    images: Vec<RunnableImage>,
+    current: Slide,
+    pending: Option<Pending>,
+    debug: bool,
+}
+
+impl Library {
+    fn open(images: Vec<RunnableImage>, index: usize, debug: bool) -> Result<Self> {
+        note_loading(debug, &images[index].path);
+        let current = load_slide(&images[index])?;
+        note_loaded(debug, current.frames.len(), slide_bytes(&current));
+        Ok(Self {
+            images,
+            current,
+            pending: None,
+            debug,
+        })
+    }
+
+    fn prefetch(&mut self, index: usize) {
+        if self.pending.as_ref().is_some_and(|job| job.index == index) {
+            return;
+        }
+        if let Some(job) = self.pending.take() {
+            let _ = job.handle.join();
+        }
+        let image = self.images[index].clone();
+        note_loading(self.debug, &image.path);
+        let debug = self.debug;
+        let (sender, report) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let slide = load_slide(&image)?;
+            if debug {
+                let _ = sender.send(LoadReport {
+                    frames: slide.frames.len(),
+                    decoded: slide_bytes(&slide),
+                });
+            }
+            Ok(slide)
+        });
+        self.pending = Some(Pending {
+            index,
+            handle,
+            report: debug.then_some(report),
+            reported: false,
+        });
+    }
+
+    /// Print the size of a prefetch once its decode has finished.
+    fn note_pending(&mut self) {
+        let Some(job) = self.pending.as_mut() else {
+            return;
+        };
+        if job.reported {
+            return;
+        }
+        let Some(report) = job.report.as_ref() else {
+            return;
+        };
+        if let Ok(report) = report.try_recv() {
+            job.reported = true;
+            note_loaded(true, report.frames, report.decoded);
+        }
+    }
+
+    fn activate(&mut self, index: usize) -> Result<()> {
+        let debug = self.debug;
+        let slide = match self.pending.take() {
+            Some(job) if job.index == index => {
+                let slide = join_loader(job.handle)?;
+                if !job.reported {
+                    note_loaded(debug, slide.frames.len(), slide_bytes(&slide));
+                }
+                slide
+            }
+            Some(job) => {
+                let _ = job.handle.join();
+                note_loading(debug, &self.images[index].path);
+                let slide = load_slide(&self.images[index])?;
+                note_loaded(debug, slide.frames.len(), slide_bytes(&slide));
+                slide
+            }
+            None => {
+                note_loading(debug, &self.images[index].path);
+                let slide = load_slide(&self.images[index])?;
+                note_loaded(debug, slide.frames.len(), slide_bytes(&slide));
+                slide
+            }
+        };
+        self.current = slide;
+        Ok(())
+    }
+}
+
+fn join_loader(handle: std::thread::JoinHandle<Result<Slide>>) -> Result<Slide> {
+    match handle.join() {
+        Ok(slide) => slide,
+        Err(_) => bail!("GIF loader stopped"),
+    }
+}
+
+fn load_slide(image: &RunnableImage) -> Result<Slide> {
+    Ok(Slide {
+        frames: load_gif(&image.path, image.position)?,
+        boxes: image.boxes,
+        opacity: image.opacity,
+    })
+}
+
+fn slide_bytes(slide: &Slide) -> u64 {
+    slide.frames.iter().map(|(image, _)| image.as_raw().len() as u64).sum()
+}
+
+fn resident_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+fn format_mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn load_summary(frames: usize, decoded: u64, resident: Option<u64>) -> String {
+    let label = if frames == 1 { "frame" } else { "frames" };
+    match resident {
+        Some(rss) => format!("{frames} {label}, {} decoded, {} resident", format_mb(decoded), format_mb(rss)),
+        None => format!("{frames} {label}, {} decoded", format_mb(decoded)),
+    }
+}
+
+fn note_loading(debug: bool, path: &Path) {
+    if debug {
+        println!("Loading {}", path.display());
+    }
+}
+
+fn note_loaded(debug: bool, frames: usize, decoded: u64) {
+    if debug {
+        println!("{}", load_summary(frames, decoded, resident_bytes()));
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -790,9 +951,11 @@ enum Phase {
 }
 
 struct Player {
-    slides: Vec<Slide>,
+    count: usize,
     index: usize,
     frame: usize,
+    /// Chosen while the current image is still on screen, so its GIF can be decoded ahead of the switch.
+    planned: Option<usize>,
     phase: Phase,
     phase_start: Instant,
     hold: Duration,
@@ -802,14 +965,15 @@ struct Player {
 }
 
 impl Player {
-    fn new(slides: Vec<Slide>, hold: Duration, fade: Duration, order: PlayOrder) -> Self {
-        let fade_in = slides.len() > 1 && !fade.is_zero();
+    fn new(count: usize, hold: Duration, fade: Duration, order: PlayOrder) -> Self {
+        let fade_in = count > 1 && !fade.is_zero();
         let mut rng = Rng::from_time();
-        let index = starting_slide(order, slides.len(), &mut rng);
+        let index = starting_slide(order, count, &mut rng);
         Self {
-            slides,
+            count,
             index,
             frame: 0,
+            planned: None,
             phase: if fade_in { Phase::In } else { Phase::Hold },
             phase_start: Instant::now(),
             hold,
@@ -819,10 +983,21 @@ impl Player {
         }
     }
 
+    /// The image to decode during this hold. The choice stays put until the switch.
+    fn planned_next(&mut self) -> Option<usize> {
+        if self.count < 2 {
+            return None;
+        }
+        if self.planned.is_none() {
+            self.planned = Some(next_slide(self.order, self.index, self.count, &mut self.rng));
+        }
+        self.planned
+    }
+
     /// Advance the fade and, when the hold is over, the current image.
     /// Returns true when the image changed.
     fn poll(&mut self, now: Instant) -> bool {
-        if self.slides.len() < 2 || (self.hold.is_zero() && self.fade.is_zero()) {
+        if self.count < 2 || (self.hold.is_zero() && self.fade.is_zero()) {
             return false;
         }
         let mut switched = false;
@@ -853,14 +1028,17 @@ impl Player {
     }
 
     fn advance(&mut self, now: Instant) {
-        self.index = next_slide(self.order, self.index, self.slides.len(), &mut self.rng);
+        self.index = match self.planned.take() {
+            Some(index) => index,
+            None => next_slide(self.order, self.index, self.count, &mut self.rng),
+        };
         self.frame = 0;
         self.phase = if self.fade.is_zero() { Phase::Hold } else { Phase::In };
         self.phase_start = now;
     }
 
     fn opacity(&self, now: Instant) -> f32 {
-        if self.slides.len() < 2 {
+        if self.count < 2 {
             return 1.0;
         }
         phase_opacity(self.phase, now.saturating_duration_since(self.phase_start), self.fade)
@@ -1845,23 +2023,34 @@ mod slideshow {
 
     #[test]
     fn the_hold_advances_a_sequential_slideshow() {
-        let pixel = RgbImage::from_pixel(1, 1, Rgb([0, 0, 0]));
-        let slide = Slide {
-            frames: vec![(pixel, Duration::from_millis(10))],
-            boxes: false,
-            opacity: 0,
-        };
-        let mut player = Player::new(
-            vec![slide.clone(), slide],
-            Duration::from_millis(30),
-            Duration::ZERO,
-            PlayOrder::Sequential,
-        );
+        let mut player = Player::new(2, Duration::from_millis(30), Duration::ZERO, PlayOrder::Sequential);
         let start = player.phase_start;
         assert_eq!(player.index, 0);
         assert!(!player.poll(start + Duration::from_millis(29)));
         assert!(player.poll(start + Duration::from_millis(30)));
         assert_eq!(player.index, 1);
+    }
+
+    #[test]
+    fn the_prefetched_index_is_the_image_that_plays_next() {
+        let mut player = Player::new(4, Duration::from_millis(10), Duration::ZERO, PlayOrder::Sequential);
+        assert_eq!(player.planned_next(), Some(1));
+        assert_eq!(player.planned_next(), Some(1));
+        let start = player.phase_start;
+        assert!(player.poll(start + Duration::from_millis(10)));
+        assert_eq!(player.index, 1);
+        assert_eq!(player.planned_next(), Some(2));
+
+        let mut random = Player::new(4, Duration::from_millis(10), Duration::ZERO, PlayOrder::Random);
+        let next = random.planned_next().unwrap();
+        assert_ne!(next, random.index);
+        let start = random.phase_start;
+        assert!(random.poll(start + Duration::from_millis(10)));
+        assert_eq!(random.index, next);
+
+        let mut single = Player::new(1, Duration::from_secs(1), Duration::from_millis(300), PlayOrder::Sequential);
+        assert!(single.planned_next().is_none());
+        assert!(!single.poll(single.phase_start + Duration::from_secs(5)));
     }
 
     #[test]
@@ -2051,5 +2240,21 @@ mod suite {
         assert!(!is_pci_address("hwmon0"));
         assert!(is_i2c_address("0000-0018"));
         assert!(!is_i2c_address("card0"));
+    }
+
+    #[test]
+    fn a_loaded_gif_reports_its_frames_and_size() {
+        let image = RgbImage::from_pixel(2, 2, Rgb([1, 2, 3]));
+        let slide = Slide {
+            frames: vec![(image, Duration::from_millis(1))],
+            boxes: false,
+            opacity: 0,
+        };
+        assert_eq!(slide_bytes(&slide), 12);
+        assert_eq!(load_summary(2, 2 * 1024 * 1024, None), "2 frames, 2.0 MB decoded");
+        assert_eq!(
+            load_summary(1, 512 * 1024, Some(3 * 1024 * 1024)),
+            "1 frame, 0.5 MB decoded, 3.0 MB resident"
+        );
     }
 }
