@@ -29,9 +29,14 @@ install -Dm755 "$bin" /usr/local/bin/kraken-gif-and-overlay
 sed -e "s|@USER@|$user|g" -e "s|@GROUP@|$group|g" -e "s|@HOME@|$home|g" \
     "$PWD/kraken-gif-and-overlay.service" > /etc/systemd/system/kraken-gif-and-overlay.service
 
-cat > /etc/udev/rules.d/70-kraken-gif-and-overlay.rules << EOF
+rm -f /etc/udev/rules.d/70-kraken-gif-and-overlay.rules
+cat > /etc/udev/rules.d/99-kraken-gif-and-overlay.rules << EOF
 SUBSYSTEM=="usb", ATTR{idVendor}=="1e71", ATTR{idProduct}=="300c", MODE="0660", GROUP="$group"
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="300c", MODE="0660", GROUP="$group"
+# 71-seat.rules marks every hidraw node as a seat device. This file is ordered
+# after that. logind then gives the node to whoever is on the seat and clears
+# group access. At boot that user is the greeter, so the service cannot open
+# it. Drop the tag and remove an ACL already applied to the current node.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1e71", ATTRS{idProduct}=="300c", TAG-="seat", TAG-="uaccess", MODE="0660", GROUP="$group", RUN+="/usr/bin/setfacl -b %E{DEVNAME}", RUN+="/bin/chgrp $group %E{DEVNAME}", RUN+="/bin/chmod 0660 %E{DEVNAME}"
 EOF
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=usb --attr-match=idVendor=1e71 --attr-match=idProduct=300c
@@ -42,6 +47,7 @@ install -d -o "$user" -g "$group" "$data"
 
 systemctl daemon-reload
 systemctl enable kraken-gif-and-overlay.service
+systemctl reset-failed kraken-gif-and-overlay.service || true
 
 if [ -f "$data/config.yml" ]; then
     systemctl restart kraken-gif-and-overlay.service

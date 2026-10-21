@@ -121,7 +121,7 @@ Building still needs libusb and hidapi, because the program links those librarie
 
 ## Install as a system service
 
-`./install.sh` asks for sudo. It installs the binary to `/usr/local/bin/kraken-gif-and-overlay`, enables a systemd service for the user who ran it, and adds a udev rule so that user can open the Kraken at boot. The service reads that user's `~/.local/share/kraken-gif-and-overlay/config.yml` and does not load shell startup files. Save a config before the service will start.
+`./install.sh` asks for sudo. It installs the binary to `/usr/local/bin/kraken-gif-and-overlay`, enables a systemd service for the user who ran it, and adds a udev rule so that user can open the Kraken at boot. The hidraw node is removed from the seat. Otherwise logind grants it to the greeter and the service fails with permission denied on `/dev/hidraw*`. The service reads that user's `~/.local/share/kraken-gif-and-overlay/config.yml` and does not load shell startup files. Save a config before the service will start.
 
 ```bash
 ./build.sh
